@@ -1,4 +1,4 @@
-# L2 WiFi AP-to-STA Bridge — Concepts and Implementation
+# L2 WiFi AP-to-STA Bridge - Concepts and Implementation
 
 ## 1. The Problem: Why L2 Bridging Is Hard on a Single-Radio Device
 

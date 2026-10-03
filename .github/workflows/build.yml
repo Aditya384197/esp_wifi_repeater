@@ -61,6 +61,60 @@ jobs:
           echo "ESP8266 firmware files produced successfully:"
           ls -lh firmware/0x00000.bin firmware/0x02000.bin firmware/0x82000.bin firmware/sha1sums
 
+      - name: Create single-file ESP8266 merged firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Create one flashable image containing exactly the three images
+          # produced by the project's Makefile at their required offsets.
+          # The merged image is intended to be flashed once at 0x00000.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          parts = [
+              (0x00000, Path("firmware/0x00000.bin")),
+              (0x02000, Path("firmware/0x02000.bin")),
+              (0x82000, Path("firmware/0x82000.bin")),
+          ]
+          out = Path("firmware/0x00000-merged.bin")
+
+          for address, path in parts:
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f"Missing or empty firmware part: {path}")
+
+          end = max(address + path.stat().st_size for address, path in parts)
+          image = bytearray(b"\xff") * end
+
+          occupied = []
+          for address, path in parts:
+              data = path.read_bytes()
+              part_end = address + len(data)
+              for old_start, old_end, old_name in occupied:
+                  if address < old_end and old_start < part_end:
+                      raise SystemExit(
+                          f"Firmware images overlap: {path} with {old_name}"
+                      )
+              image[address:part_end] = data
+              occupied.append((address, part_end, str(path)))
+
+          out.write_bytes(image)
+          print(f"Created: {out}")
+          print(f"Flash address: 0x00000")
+          print(f"Image size: {len(image)} bytes")
+          PY
+
+          test -s firmware/0x00000-merged.bin
+          ls -lh firmware/0x00000.bin firmware/0x02000.bin firmware/0x82000.bin firmware/0x00000-merged.bin
+
+      - name: Verify single-file firmware image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s firmware/0x00000-merged.bin
+          echo "Single-file ESP8266 firmware ready."
+          echo "Flash address: 0x00000"
+
       - name: Commit updated firmware to repository
         shell: bash
         run: |
@@ -73,7 +127,8 @@ jobs:
             firmware/0x00000.bin \
             firmware/0x02000.bin \
             firmware/0x82000.bin \
-            firmware/sha1sums
+            firmware/sha1sums \
+            firmware/0x00000-merged.bin
 
           if git diff --cached --quiet; then
             echo "Firmware is already up to date. No commit required."

@@ -1,39 +1,77 @@
-# Place this file at: .github/workflows/build.yml
-name: Build ESP8266 WiFi Repeater
+# Path in repo: .github/workflows/build.yml
+# Builds ONLY the ESP8266 WiFi repeater (VARIANT=bridge), writes the new bins
+# into the root firmware/ folder and commits them back automatically.
+name: Build ESP8266 Repeater Firmware
 
 on:
   push:
-  pull_request:
+    branches: [ main, master ]
+    paths-ignore:
+      - 'firmware/**'
+      - 'firmware-repeater/**'
+      - '**.md'
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-esp8266-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [bridge, default]   # bridge = L2 WiFi repeater, default = NAT router
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build (${{ matrix.variant }}) in martinfger/iot_devel
+      - name: Build firmware (VARIANT=bridge)
         run: |
           chmod -R a+rwX "$GITHUB_WORKSPACE"
           docker run --rm --user root \
             -v "$GITHUB_WORKSPACE":/home/esp/esp_wifi_repeater \
             -w /home/esp/esp_wifi_repeater \
             martinfger/iot_devel:1.0 \
-            bash -c "make clean && make VARIANT=${{ matrix.variant }} V=1"
+            bash -c "rm -rf build && make VARIANT=bridge V=1"
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
-          ls -l firmware
-          cat firmware/sha1sums
 
-      - name: Upload firmware
+      - name: Create single flashable bin (flash at 0x0)
+        run: |
+          set -e
+          test -s firmware/0x02000.bin
+          test -s rboot.bin
+          python3 - <<'PY'
+          rb  = open('rboot.bin', 'rb').read()
+          app = open('firmware/0x02000.bin', 'rb').read()
+          assert len(rb) <= 0x2000
+          out = rb + b'\xff' * (0x2000 - len(rb)) + app
+          open('firmware/ESP8266_Repeater_FULL_flash_at_0x0.bin', 'wb').write(out)
+          print('full image bytes:', len(out))
+          PY
+          cd firmware
+          sha1sum 0x00000.bin 0x02000.bin 0x82000.bin ESP8266_Repeater_FULL_flash_at_0x0.bin > sha1sums
+          ls -l
+
+      - name: Commit new firmware to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f firmware
+          if git diff --cached --quiet; then
+            echo "No firmware change"
+          else
+            git commit -m "Auto-build: update ESP8266 repeater firmware [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: esp_wifi_repeater_${{ matrix.variant }}
+          name: ESP8266_Repeater_firmware
           path: |
+            firmware/ESP8266_Repeater_FULL_flash_at_0x0.bin
             firmware/0x00000.bin
             firmware/0x02000.bin
             firmware/0x82000.bin

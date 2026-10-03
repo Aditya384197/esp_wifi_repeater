@@ -2,9 +2,9 @@ name: Build ESP8266 Firmware
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
+# The workflow updates firmware files in this repository.
 permissions:
   contents: write
 
@@ -18,67 +18,50 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Build firmware inside ESP8266 build container
+      - name: Build ESP8266 firmware with the project's legacy toolchain
         shell: bash
         run: |
           set -euo pipefail
 
+          # IMPORTANT:
+          # The Makefile expects esp-open-sdk beside this repository:
+          #   /home/esp/esp_wifi_repeater
+          #   /home/esp/esp-open-sdk
+          # The Docker image already contains that SDK, so mount only the
+          # repository at the expected path instead of using /workspace.
+          # Run with the GitHub runner UID/GID so Docker-created files are
+          # writable by the runner and no permission error is left behind.
           docker run --rm \
-            -v "$GITHUB_WORKSPACE:/workspace" \
-            -w /workspace \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env USER=runner \
+            --volume "$GITHUB_WORKSPACE:/home/esp/esp_wifi_repeater" \
+            --workdir /home/esp/esp_wifi_repeater \
             martinfger/iot_devel:1.0 \
-            bash -lc 'make'
+            bash -lc 'set -e; make clean; make'
 
-      - name: Update main firmware BIN in repository
+      - name: Verify ESP8266 firmware output
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p firmware
+          for file in \
+            firmware/0x00000.bin \
+            firmware/0x02000.bin \
+            firmware/0x82000.bin \
+            firmware/sha1sums; do
+            test -s "$file" || {
+              echo "ERROR: Missing or empty firmware file: $file"
+              exit 1
+            }
+          done
 
-          # Find the firmware BIN produced by the build, while ignoring
-          # the repository's existing firmware/ copy.
-          mapfile -t BUILT_BINS < <(
-            find . -type f -name '*.bin' \
-              ! -path './firmware/*' \
-              ! -path './.git/*' \
-              -print
-          )
+          echo "ESP8266 firmware files produced successfully:"
+          ls -lh firmware/0x00000.bin firmware/0x02000.bin firmware/0x82000.bin firmware/sha1sums
 
-          if [ "${#BUILT_BINS[@]}" -eq 0 ]; then
-            echo "ERROR: No newly built .bin firmware was found."
-            exit 1
-          fi
-
-          if [ "${#BUILT_BINS[@]}" -gt 1 ]; then
-            echo "ERROR: More than one newly built .bin was found:"
-            printf '  %s\n' "${BUILT_BINS[@]}"
-            echo "Refusing to guess which firmware is the main ESP8266 firmware."
-            exit 1
-          fi
-
-          BUILT_BIN="${BUILT_BINS[0]}"
-
-          # Use the existing main BIN name when exactly one BIN already
-          # exists in the repository's firmware/ directory.
-          mapfile -t MAIN_BINS < <(
-            find firmware -maxdepth 1 -type f -name '*.bin' -print
-          )
-
-          if [ "${#MAIN_BINS[@]}" -eq 1 ]; then
-            TARGET_BIN="${MAIN_BINS[0]}"
-          else
-            TARGET_BIN="firmware/esp_wifi_repeater.bin"
-          fi
-
-          echo "Built firmware : $BUILT_BIN"
-          echo "Repository BIN : $TARGET_BIN"
-
-          cp -f "$BUILT_BIN" "$TARGET_BIN"
-          ls -lh "$TARGET_BIN"
-
-      - name: Commit updated firmware BIN
+      - name: Commit updated firmware to repository
         shell: bash
         run: |
           set -euo pipefail
@@ -86,12 +69,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add firmware/*.bin
+          git add \
+            firmware/0x00000.bin \
+            firmware/0x02000.bin \
+            firmware/0x82000.bin \
+            firmware/sha1sums
 
           if git diff --cached --quiet; then
-            echo "No firmware change to commit."
+            echo "Firmware is already up to date. No commit required."
             exit 0
           fi
 
-          git commit -m "Update ESP8266 firmware build"
+          git commit -m "Update ESP8266 firmware [skip ci]"
           git push

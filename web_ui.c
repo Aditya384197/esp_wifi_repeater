@@ -11,14 +11,25 @@
  *  - status page: link state, last disconnect reason, RSSI, channel, IP, ...
  *  - scan for networks, Save / Save&Connect / Restart / Factory reset
  */
-#include "user_config.h"
+/* include order identical to user_main.c: lwip headers need err_t/ip_addr_t first */
+#include "stdint.h"
 #include "c_types.h"
 #include "mem.h"
 #include "ets_sys.h"
 #include "osapi.h"
+#include "gpio.h"
 #include "os_type.h"
-#include "user_interface.h"
+#include "lwip/ip.h"
+#include "lwip/netif.h"
+#include "lwip/dns.h"
+#include "lwip/lwip_napt.h"
+#include "lwip/ip_route.h"
+#include "lwip/app/dhcpserver.h"
 #include "lwip/app/espconn.h"
+#include "lwip/app/espconn_tcp.h"
+#include "user_interface.h"
+#include "string.h"
+#include "user_config.h"
 #include "config_flash.h"
 #include "sys_time.h"
 #include "web_ui.h"
@@ -104,7 +115,14 @@ static void ICACHE_FLASH_ATTR web_tx_next(struct espconn *c)
             if (web_tx[i].fl != NULL)
             {
                 /* WEB_CHUNK is a multiple of 4: flash reads stay word aligned */
-                os_memcpy(web_tx[i].buf, web_tx[i].fl + off, (n + 3) & ~3);
+                {
+                    /* flash must be read with aligned 32-bit accesses */
+                    const uint32_t *src = (const uint32_t *)(web_tx[i].fl + off);
+                    uint32_t *dst = (uint32_t *)web_tx[i].buf;
+                    uint16_t w, words = (n + 3) / 4;
+                    for (w = 0; w < words; w++)
+                        dst[w] = src[w];
+                }
                 espconn_send(c, (uint8_t *)web_tx[i].buf, n);
             }
             else
@@ -422,9 +440,10 @@ static void ICACHE_FLASH_ATTR web_scan_done(void *arg, STATUS status)
             {
                 if (web_scan[j].rssi > web_scan[i].rssi)
                 {
-                    web_scan_t t = web_scan[i];
-                    web_scan[i] = web_scan[j];
-                    web_scan[j] = t;
+                    web_scan_t t;
+                    os_memcpy(&t, &web_scan[i], sizeof(t));
+                    os_memcpy(&web_scan[i], &web_scan[j], sizeof(t));
+                    os_memcpy(&web_scan[j], &t, sizeof(t));
                 }
             }
         }

@@ -48,7 +48,6 @@
 
 #if WEB_CONFIG
 #include "web.h"
-#include "web_ui.h"
 #endif
 
 #if ACLS
@@ -108,6 +107,7 @@ sysconfig_t config;
 static ringbuf_t console_rx_buffer, console_tx_buffer;
 
 static ip_addr_t my_ip;
+static ip_addr_t my_gw;
 static ip_addr_t dns_ip;
 bool connected;
 uint8_t my_channel;
@@ -118,7 +118,6 @@ static ip_addr_t resolve_ip;
 
 uint8_t mesh_level;
 uint8_t uplink_bssid[6];
-uint8_t web_last_disc_reason; /* last STA disconnect reason (shown on web dashboard) */
 
 static netif_input_fn orig_input_ap, orig_input_sta;
 static netif_linkoutput_fn orig_output_ap, orig_output_sta;
@@ -3419,44 +3418,608 @@ static void ICACHE_FLASH_ATTR tcp_client_connected_cb(void *arg)
 #endif /* REMOTE_CONFIG */
 
 #if WEB_CONFIG
-/* The web dashboard lives in web_ui.c */
-static void ICACHE_FLASH_ATTR web_config_client_recv_cb(void *arg, char *data, unsigned short length)
+#define WEB_RX_BUFFER_SIZE 1024
+
+typedef struct {
+    char request[WEB_RX_BUFFER_SIZE];
+    uint16_t used;
+    bool handled;
+    bool restart;
+} web_client_state_t;
+
+static os_timer_t web_restart_timer;
+
+static const char * ICACHE_FLASH_ATTR web_find_char(const char *s, char wanted)
 {
-    web_ui_recv(arg, data, length);
+    if (s == NULL) return NULL;
+    while (*s)
+    {
+        if (*s == wanted) return s;
+        s++;
+    }
+    return NULL;
+}
+
+static int ICACHE_FLASH_ATTR web_hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool ICACHE_FLASH_ATTR web_url_decode(const char *src, uint16_t src_len,
+                                             char *dst, uint16_t dst_size)
+{
+    uint16_t i, out = 0;
+    if (dst_size == 0) return false;
+
+    for (i = 0; i < src_len; i++)
+    {
+        char c = src[i];
+        if (c == '%')
+        {
+            if (i + 2 >= src_len) return false;
+            int h = web_hex_value(src[i + 1]);
+            int l = web_hex_value(src[i + 2]);
+            if (h < 0 || l < 0) return false;
+            c = (char)((h << 4) | l);
+            i += 2;
+        }
+        else if (c == '+')
+        {
+            c = ' ';
+        }
+
+        if (out + 1 >= dst_size) return false;
+        dst[out++] = c;
+    }
+    dst[out] = '\0';
+    return true;
+}
+
+static bool ICACHE_FLASH_ATTR web_get_param(const char *query, const char *wanted,
+                                            char *out, uint16_t out_size)
+{
+    const char *p = query;
+    char key[32];
+
+    if (out_size == 0) return false;
+    out[0] = '\0';
+    if (query == NULL) return false;
+
+    while (*p)
+    {
+        const char *pair_end = web_find_char(p, '&');
+        const char *eq = web_find_char(p, '=');
+        uint16_t pair_len = pair_end ? (uint16_t)(pair_end - p) : (uint16_t)os_strlen(p);
+        if (eq == NULL || eq > p + pair_len)
+        {
+            if (pair_end == NULL) break;
+            p = pair_end + 1;
+            continue;
+        }
+
+        uint16_t key_len = (uint16_t)(eq - p);
+        uint16_t value_len = (uint16_t)(pair_len - key_len - 1);
+        if (!web_url_decode(p, key_len, key, sizeof(key))) return false;
+        if (os_strcmp(key, wanted) == 0)
+            return web_url_decode(eq + 1, value_len, out, out_size);
+
+        if (pair_end == NULL) break;
+        p = pair_end + 1;
+    }
+    return false;
+}
+
+static bool ICACHE_FLASH_ATTR web_parse_ipv4(const char *text, ip_addr_t *out)
+{
+    uint8_t octet[4];
+    uint8_t part = 0, digits = 0;
+    uint16_t value = 0;
+    const char *p = text;
+
+    if (text == NULL || out == NULL || *text == '\0') return false;
+
+    while (true)
+    {
+        char c = *p++;
+        if (c >= '0' && c <= '9')
+        {
+            if (digits >= 3) return false;
+            value = (uint16_t)(value * 10 + (uint16_t)(c - '0'));
+            if (value > 255) return false;
+            digits++;
+            continue;
+        }
+        if (c == '.' && part < 3 && digits != 0)
+        {
+            octet[part++] = (uint8_t)value;
+            value = 0;
+            digits = 0;
+            continue;
+        }
+        if (c == '\0' && part == 3 && digits != 0)
+        {
+            octet[3] = (uint8_t)value;
+            out->addr = htonl(((uint32_t)octet[0] << 24) |
+                              ((uint32_t)octet[1] << 16) |
+                              ((uint32_t)octet[2] << 8) |
+                              octet[3]);
+            return true;
+        }
+        return false;
+    }
+}
+
+static void ICACHE_FLASH_ATTR web_html_escape(const char *src, char *dst, uint16_t dst_size)
+{
+    uint16_t out = 0;
+    const char *s = src ? src : "";
+    while (*s && out + 1 < dst_size)
+    {
+        const char *replacement = NULL;
+        if (*s == '&') replacement = "&amp;";
+        else if (*s == '<') replacement = "&lt;";
+        else if (*s == '>') replacement = "&gt;";
+        else if (*s == '\"') replacement = "&quot;";
+
+        if (replacement)
+        {
+            uint16_t n = (uint16_t)os_strlen(replacement);
+            if (out + n >= dst_size) break;
+            os_memcpy(dst + out, replacement, n);
+            out += n;
+        }
+        else
+            dst[out++] = *s;
+        s++;
+    }
+    dst[out] = '\0';
+}
+
+static void ICACHE_FLASH_ATTR web_signal_text(char *signal, char *distance)
+{
+    int rssi, percent;
+
+    if (!connected)
+    {
+        os_sprintf(signal, "Not connected");
+        os_sprintf(distance, "N/A");
+        return;
+    }
+
+    rssi = wifi_station_get_rssi();
+    percent = (rssi + 100) * 2;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    os_sprintf(signal, "%d dBm (%d%%)", rssi, percent);
+
+    if (rssi >= -50) os_sprintf(distance, "~1-3 m");
+    else if (rssi >= -60) os_sprintf(distance, "~3-7 m");
+    else if (rssi >= -70) os_sprintf(distance, "~7-15 m");
+    else if (rssi >= -80) os_sprintf(distance, "~15-25 m");
+    else os_sprintf(distance, ">25 m");
+}
+
+static void ICACHE_FLASH_ATTR web_send_text(struct espconn *pespconn, const char *title,
+                                            const char *message)
+{
+    char response[768];
+    os_sprintf(response,
+               "HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+               "Connection: close\r\nCache-Control: no-store\r\n\r\n"
+               "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+               "<html><body><h1>%s</h1><p>%s</p><p><a href='/'>Back</a></p></body></html>",
+               title, message);
+    espconn_send(pespconn, (uint8_t *)response, os_strlen(response));
+}
+
+static void ICACHE_FLASH_ATTR web_send_config_page(struct espconn *pespconn, const char *message)
+{
+    static const uint8_t config_page_str[] ICACHE_RODATA_ATTR STORE_ATTR = CONFIG_PAGE;
+    uint32_t slen = sizeof(config_page_str);
+    uint8_t *page_buf;
+    char ssid_html[160], ap_ssid_html[160];
+    char signal[64], distance[32];
+    char ip[20], gw[20], bssid[20], network[20];
+    const char *status = connected ? "Connected" : "Disconnected";
+    uint8_t clients = 0;
+
+    web_html_escape((char *)config.ssid, ssid_html, sizeof(ssid_html));
+    web_html_escape((char *)config.ap_ssid, ap_ssid_html, sizeof(ap_ssid_html));
+    web_signal_text(signal, distance);
+
+    if (connected)
+    {
+        os_sprintf(ip, IPSTR, IP2STR(&my_ip));
+        os_sprintf(gw, IPSTR, IP2STR(&my_gw));
+        mac_2_buff(bssid, uplink_bssid);
+    }
+    else
+    {
+        os_sprintf(ip, "N/A");
+        os_sprintf(gw, "N/A");
+        os_sprintf(bssid, "N/A");
+    }
+
+    os_sprintf(network, "%d.%d.%d.%d", IP2STR(&config.network_addr));
+    if (config.ap_on)
+        clients = wifi_softap_get_station_num();
+
+    page_buf = (uint8_t *)os_malloc(slen + 1200);
+    if (page_buf == NULL)
+    {
+        web_send_text(pespconn, "ESP WiFi Repeater", "Out of memory while rendering the configuration page.");
+        return;
+    }
+
+    os_sprintf(page_buf, config_page_str,
+               message ? message : "Ready",
+               status,
+               signal,
+               distance,
+               my_channel,
+               ip,
+               gw,
+               bssid,
+               clients,
+               system_get_free_heap_size(),
+               ssid_html,
+               ssid_html,
+               ap_ssid_html,
+               config.ap_open ? " selected" : "",
+               config.ap_open ? "" : " selected",
+               network);
+
+    espconn_send(pespconn, page_buf, os_strlen((char *)page_buf));
+    os_free(page_buf);
+}
+
+static void ICACHE_FLASH_ATTR web_restart_timer_func(void *arg)
+{
+    system_restart();
+    while (true)
+        ;
+}
+
+static bool ICACHE_FLASH_ATTR web_apply_query(const char *query, char *message, uint16_t message_size,
+                                              bool *restart)
+{
+    char action[20], ssid[65], password[96], ap_ssid[65], ap_password[96];
+    char network[32], ap_open[8], unlock_password[96], am[16], lock[8];
+    bool has_action, has_ssid, has_password, has_ap_ssid, has_ap_password;
+    bool has_network, has_ap_open, has_unlock, has_am, has_lock;
+    bool changed = false, reboot = false;
+    ip_addr_t new_network;
+
+    (void)message_size;
+    if (restart) *restart = false;
+    os_sprintf(message, "Ready");
+
+    has_action = web_get_param(query, "action", action, sizeof(action));
+    has_ssid = web_get_param(query, "ssid", ssid, sizeof(ssid));
+    has_password = web_get_param(query, "password", password, sizeof(password));
+    has_ap_ssid = web_get_param(query, "ap_ssid", ap_ssid, sizeof(ap_ssid));
+    has_ap_password = web_get_param(query, "ap_password", ap_password, sizeof(ap_password));
+    has_network = web_get_param(query, "network", network, sizeof(network));
+    has_ap_open = web_get_param(query, "ap_open", ap_open, sizeof(ap_open));
+    has_unlock = web_get_param(query, "unlock_password", unlock_password, sizeof(unlock_password));
+    has_am = web_get_param(query, "am", am, sizeof(am));
+    has_lock = web_get_param(query, "lock", lock, sizeof(lock));
+
+    if (config.locked)
+    {
+        if (has_unlock)
+        {
+            if (os_strlen(config.lock_password) != 0 &&
+                os_strcmp(unlock_password, config.lock_password) == 0)
+            {
+                config.locked = 0;
+                config_save(&config);
+                os_sprintf(message, "Configuration unlocked");
+            }
+            else
+                os_sprintf(message, "Invalid unlock password");
+            return true;
+        }
+        os_sprintf(message, "Configuration is locked");
+        return true;
+    }
+
+    if (has_ssid)
+    {
+        if (os_strlen(ssid) == 0 || os_strlen(ssid) >= sizeof(config.ssid))
+        {
+            os_sprintf(message, "Invalid SSID (1-31 characters required)");
+            return false;
+        }
+        if (os_strcmp(config.ssid, ssid) != 0)
+        {
+            os_memset(config.ssid, 0, sizeof(config.ssid));
+            os_memcpy(config.ssid, ssid, os_strlen(ssid));
+            os_memset(config.bssid, 0, sizeof(config.bssid));
+            changed = true;
+        }
+    }
+
+    if (has_password)
+    {
+        if (os_strlen(password) > sizeof(config.password) - 1)
+        {
+            os_sprintf(message, "Router password is too long (max 64 characters)");
+            return false;
+        }
+        if (os_strlen(password) != 0 && os_strcmp(config.password, password) != 0)
+        {
+            os_memset(config.password, 0, sizeof(config.password));
+            os_memcpy(config.password, password, os_strlen(password));
+            changed = true;
+        }
+    }
+
+    if (has_ap_ssid)
+    {
+        if (os_strlen(ap_ssid) == 0 || os_strlen(ap_ssid) >= sizeof(config.ap_ssid))
+        {
+            os_sprintf(message, "Invalid AP SSID (1-31 characters required)");
+            return false;
+        }
+        if (os_strcmp(config.ap_ssid, ap_ssid) != 0)
+        {
+            os_memset(config.ap_ssid, 0, sizeof(config.ap_ssid));
+            os_memcpy(config.ap_ssid, ap_ssid, os_strlen(ap_ssid));
+            changed = true;
+            reboot = true;
+        }
+    }
+
+    if (has_ap_password && os_strlen(ap_password) != 0)
+    {
+        if (os_strlen(ap_password) > sizeof(config.ap_password) - 1)
+        {
+            os_sprintf(message, "AP password is too long (max 63 characters)");
+            return false;
+        }
+        if (os_strlen(ap_password) < 8)
+        {
+            os_sprintf(message, "WPA2 AP password must be at least 8 characters");
+            return false;
+        }
+        if (os_strcmp(config.ap_password, ap_password) != 0)
+        {
+            os_memset(config.ap_password, 0, sizeof(config.ap_password));
+            os_memcpy(config.ap_password, ap_password, os_strlen(ap_password));
+            changed = true;
+            reboot = true;
+        }
+    }
+
+    if (has_ap_open)
+    {
+        bool new_open;
+        if (os_strcmp(ap_open, "open") == 0) new_open = true;
+        else if (os_strcmp(ap_open, "wpa2") == 0) new_open = false;
+        else
+        {
+            os_sprintf(message, "Invalid AP security mode");
+            return false;
+        }
+        if (!new_open && os_strlen(config.ap_password) < 8)
+        {
+            os_sprintf(message, "Set an AP password of at least 8 characters before enabling WPA2");
+            return false;
+        }
+        if (config.ap_open != new_open)
+        {
+            config.ap_open = new_open;
+            changed = true;
+            reboot = true;
+        }
+    }
+
+    if (has_network)
+    {
+        if (!web_parse_ipv4(network, &new_network))
+        {
+            os_sprintf(message, "Invalid AP network address");
+            return false;
+        }
+        ip4_addr4(&new_network) = 0;
+        if (config.network_addr.addr != new_network.addr)
+        {
+            config.network_addr = new_network;
+            changed = true;
+            reboot = true;
+        }
+    }
+
+    if (has_am && os_strcmp(am, "mesh") == 0)
+    {
+        config.automesh_mode = AUTOMESH_LEARNING;
+        config.automesh_checked = 0;
+        changed = true;
+        reboot = true;
+    }
+
+    if (has_lock || (has_action && os_strcmp(action, "lock") == 0))
+    {
+        uint16_t copy_len = (uint16_t)(sizeof(config.password) < sizeof(config.lock_password) ?
+                                       sizeof(config.password) : sizeof(config.lock_password) - 1);
+        os_memset(config.lock_password, 0, sizeof(config.lock_password));
+        os_memcpy(config.lock_password, config.password, copy_len);
+        config.locked = 1;
+        changed = true;
+    }
+
+    if (has_action && os_strcmp(action, "connect") == 0)
+    {
+        config.auto_connect = 1;
+        config.automesh_mode = AUTOMESH_OFF;
+        os_memset(config.bssid, 0, sizeof(config.bssid));
+        changed = true;
+        reboot = true;
+    }
+    else if (has_action && os_strcmp(action, "restart") == 0)
+    {
+        reboot = true;
+    }
+    else if (has_action && os_strcmp(action, "save") != 0 &&
+             os_strcmp(action, "lock") != 0)
+    {
+        os_sprintf(message, "Unknown action");
+        return false;
+    }
+
+    if (web_get_param(query, "reset", lock, sizeof(lock)))
+        reboot = true;
+
+    if (changed)
+        config_save(&config);
+
+    if (has_action && os_strcmp(action, "connect") == 0)
+        os_sprintf(message, "Settings saved. Restarting and connecting to the uplink...");
+    else if (reboot && !(has_action && os_strcmp(action, "lock") == 0))
+        os_sprintf(message, "Settings saved. Restarting device...");
+    else if (changed && !(has_action && os_strcmp(action, "lock") == 0))
+        os_sprintf(message, "Settings saved");
+
+    if (restart) *restart = reboot;
+    return true;
+}
+
+static void ICACHE_FLASH_ATTR web_config_client_recv_cb(void *arg,
+                                                        char *data,
+                                                        unsigned short length)
+{
+    struct espconn *pespconn = (struct espconn *)arg;
+    web_client_state_t *state = (web_client_state_t *)pespconn->reverse;
+    char *line_end, *sp1, *sp2, *query = NULL;
+    char message[160];
+
+    if (state == NULL || state->handled)
+        return;
+
+    if ((uint32_t)state->used + length >= WEB_RX_BUFFER_SIZE)
+    {
+        state->handled = true;
+        web_send_text(pespconn, "Request too large", "The configuration request is too large.");
+        return;
+    }
+
+    os_memcpy(state->request + state->used, data, length);
+    state->used = (uint16_t)(state->used + length);
+    state->request[state->used] = '\0';
+
+    line_end = os_strstr(state->request, "\r\n");
+    if (line_end == NULL)
+        return;
+
+    *line_end = '\0';
+    sp1 = (char *)web_find_char(state->request, ' ');
+    if (sp1 == NULL)
+    {
+        state->handled = true;
+        web_send_text(pespconn, "Bad request", "Invalid HTTP request line.");
+        return;
+    }
+    *sp1++ = '\0';
+    sp2 = (char *)web_find_char(sp1, ' ');
+    if (sp2 == NULL)
+    {
+        state->handled = true;
+        web_send_text(pespconn, "Bad request", "Invalid HTTP request line.");
+        return;
+    }
+    *sp2 = '\0';
+
+    if (os_strcmp(state->request, "GET") != 0)
+    {
+        state->handled = true;
+        web_send_text(pespconn, "Method not supported", "Use GET for the configuration interface.");
+        return;
+    }
+
+    query = (char *)web_find_char(sp1, '?');
+    if (query != NULL)
+        *query++ = '\0';
+    else
+        query = "";
+
+    if (!web_apply_query(query, message, sizeof(message), &state->restart))
+        state->restart = false;
+
+    state->handled = true;
+
+    if (config.locked && !state->restart)
+    {
+        static const uint8_t lock_page_str[] ICACHE_RODATA_ATTR STORE_ATTR = LOCK_PAGE;
+        uint32_t slen = sizeof(lock_page_str);
+        uint8_t *lock_page = (uint8_t *)os_malloc(slen);
+        if (lock_page)
+        {
+            os_memcpy(lock_page, lock_page_str, slen);
+            espconn_send(pespconn, lock_page, os_strlen((char *)lock_page));
+            os_free(lock_page);
+        }
+        else
+            web_send_text(pespconn, "Configuration Locked", "Unlock page could not be rendered due to low memory.");
+    }
+    else
+    {
+        web_send_config_page(pespconn, message);
+    }
 }
 
 static void ICACHE_FLASH_ATTR web_config_client_discon_cb(void *arg)
 {
-    web_ui_discon(arg);
-}
-
-static void ICACHE_FLASH_ATTR web_config_client_recon_cb(void *arg, sint8 err)
-{
-    web_ui_discon(arg);
+    struct espconn *pespconn = (struct espconn *)arg;
+    web_client_state_t *state = (web_client_state_t *)pespconn->reverse;
+    if (state)
+    {
+        os_free(state);
+        pespconn->reverse = NULL;
+    }
 }
 
 static void ICACHE_FLASH_ATTR web_config_client_sent_cb(void *arg)
 {
-    web_ui_sent(arg);
+    struct espconn *pespconn = (struct espconn *)arg;
+    web_client_state_t *state = (web_client_state_t *)pespconn->reverse;
+
+    if (state && state->restart)
+    {
+        os_timer_setfn(&web_restart_timer, web_restart_timer_func, NULL);
+        os_timer_arm(&web_restart_timer, 300, 0);
+    }
+    espconn_disconnect(pespconn);
 }
 
-/* Called when a client connects to the web config */
 static void ICACHE_FLASH_ATTR web_config_client_connected_cb(void *arg)
 {
     struct espconn *pespconn = (struct espconn *)arg;
+    web_client_state_t *state;
 
     if (!check_connection_access(pespconn, config.config_access))
     {
-        os_printf("Client disconnected - no config access on this network\r\n");
+        os_printf("Web client disconnected - no config access on this network\r\n");
         espconn_disconnect(pespconn);
         return;
     }
 
+    state = (web_client_state_t *)os_zalloc(sizeof(web_client_state_t));
+    if (state == NULL)
+    {
+        web_send_text(pespconn, "ESP WiFi Repeater", "Not enough memory for a web session.");
+        espconn_disconnect(pespconn);
+        return;
+    }
+
+    pespconn->reverse = state;
     espconn_regist_disconcb(pespconn, web_config_client_discon_cb);
-    espconn_regist_reconcb(pespconn, web_config_client_recon_cb);
     espconn_regist_recvcb(pespconn, web_config_client_recv_cb);
     espconn_regist_sentcb(pespconn, web_config_client_sent_cb);
-    espconn_regist_time(pespconn, 20, 1); /* close idle web connections after 20 s */
+    espconn_regist_time(pespconn, 30, 1);
 }
 #endif /* WEB_CONFIG */
 
@@ -3757,6 +4320,19 @@ void wifi_handle_event_cb(System_Event_t *evt)
         my_channel = evt->event_info.connected.channel;
         os_memcpy(uplink_bssid, evt->event_info.connected.bssid, sizeof(uplink_bssid));
 
+#ifdef REPEATER_MODE
+        {
+            struct softap_config ap_cfg;
+            wifi_softap_get_config(&ap_cfg);
+            if (ap_cfg.channel != my_channel)
+            {
+                ap_cfg.channel = my_channel;
+                wifi_softap_set_config(&ap_cfg);
+            }
+            wifi_set_sleep_type(NONE_SLEEP_T);
+        }
+#endif
+
         bool wrong_bssid = false;
         if (*(int *)config.bssid != 0)
         {
@@ -3792,8 +4368,16 @@ void wifi_handle_event_cb(System_Event_t *evt)
 
     case EVENT_STAMODE_DISCONNECTED:
         os_printf("disconnect from ssid %s, reason %d\r\n", evt->event_info.disconnected.ssid, evt->event_info.disconnected.reason);
-        web_last_disc_reason = evt->event_info.disconnected.reason;
         connected = false;
+        my_ip.addr = 0;
+        my_gw.addr = 0;
+        my_channel = 0;
+
+#ifdef REPEATER_MODE
+        bridge_uplink_down();
+        /* Restore the recovery AP/DHCP management path after uplink loss. */
+        do_ip_config = true;
+#endif
 
 #if MDNS_REPEATER
         espconn_mdns_close();
@@ -3859,6 +4443,7 @@ void wifi_handle_event_cb(System_Event_t *evt)
         os_printf("ip:" IPSTR ",mask:" IPSTR ",gw:" IPSTR ",dns:" IPSTR "\n", IP2STR(&evt->event_info.got_ip.ip), IP2STR(&evt->event_info.got_ip.mask), IP2STR(&evt->event_info.got_ip.gw), IP2STR(&dns_ip));
 
         my_ip = evt->event_info.got_ip.ip;
+        my_gw = evt->event_info.got_ip.gw;
         connected = true;
 
 #ifndef REPEATER_MODE
@@ -3877,7 +4462,11 @@ void wifi_handle_event_cb(System_Event_t *evt)
                 if (nif->num == 1 && !ap_nif) ap_nif = nif;
             }
             if (sta_nif && ap_nif)
+            {
+                user_set_softap_ip_config();
+                do_ip_config = false;
                 bridge_init(sta_nif, ap_nif);
+            }
             else
                 os_printf("bridge_init: netif not found\n");
         }
@@ -3941,23 +4530,25 @@ void wifi_handle_event_cb(System_Event_t *evt)
 void ICACHE_FLASH_ATTR user_set_softap_wifi_config(void)
 {
     struct softap_config apConfig;
+    uint16_t ssid_len = (uint16_t)os_strlen(config.ap_ssid);
+    uint16_t password_len = (uint16_t)os_strlen(config.ap_password);
 
-    wifi_softap_get_config(&apConfig); // Get config first.
+    wifi_softap_get_config(&apConfig);
 
-    os_memset(apConfig.ssid, 0, 32);
-    os_sprintf(apConfig.ssid, "%s", config.ap_ssid);
-    os_memset(apConfig.password, 0, 64);
-    os_sprintf(apConfig.password, "%s", config.ap_password);
-    if (!config.ap_open)
-        apConfig.authmode = AUTH_WPA_WPA2_PSK;
-    else
-        apConfig.authmode = AUTH_OPEN;
-    apConfig.ssid_len = 0; // or its actual length
+    os_memset(apConfig.ssid, 0, sizeof(apConfig.ssid));
+    if (ssid_len >= sizeof(apConfig.ssid))
+        ssid_len = sizeof(apConfig.ssid) - 1;
+    os_memcpy(apConfig.ssid, config.ap_ssid, ssid_len);
+    apConfig.ssid_len = ssid_len;
 
-    apConfig.max_connection = config.max_clients; // how many stations can connect to ESP8266 softAP at most.
+    os_memset(apConfig.password, 0, sizeof(apConfig.password));
+    if (password_len >= sizeof(apConfig.password))
+        password_len = sizeof(apConfig.password) - 1;
+    os_memcpy(apConfig.password, config.ap_password, password_len);
+
+    apConfig.authmode = config.ap_open ? AUTH_OPEN : AUTH_WPA_WPA2_PSK;
+    apConfig.max_connection = config.max_clients;
     apConfig.ssid_hidden = config.ssid_hidden;
-
-    // Set ESP8266 softap config
     wifi_softap_set_config(&apConfig);
 }
 
@@ -3968,68 +4559,55 @@ void ICACHE_FLASH_ATTR user_set_softap_ip_config(void)
     struct netif *nif;
     int i;
 
-    // Configure the internal network
-
-    // Find the netif of the AP (that with num != 0)
     for (nif = netif_list; nif != NULL && nif->num == 0; nif = nif->next)
         ;
     if (nif == NULL)
         return;
-    // If is not 1, set it to 1.
-    // Kind of a hack, but the Espressif-internals expect it like this (hardcoded 1).
     nif->num = 1;
 
     wifi_softap_dhcps_stop();
 
 #ifdef REPEATER_MODE
-    if (os_strcmp(config.ssid, WIFI_SSID) != 0) {
-        /* Bridge mode: Use a dummy subnet to avoid overlap with the bridged network.
-           The bridge logic will handle the actual data plane. */
+    if (connected)
+    {
         IP4_ADDR(&info.ip, 172, 31, 255, 1);
         IP4_ADDR(&info.netmask, 255, 255, 255, 0);
         info.gw = info.ip;
-    } else {
-        /* Config mode: Use the configured address */
+    }
+    else
+#endif
+    {
         info.ip = config.network_addr;
         ip4_addr4(&info.ip) = 1;
         info.gw = info.ip;
         IP4_ADDR(&info.netmask, 255, 255, 255, 0);
     }
-#else
-    info.ip = config.network_addr;
-    ip4_addr4(&info.ip) = 1;
-    info.gw = info.ip;
-    IP4_ADDR(&info.netmask, 255, 255, 255, 0);
-#endif
 
     wifi_set_ip_info(nif->num, &info);
-
-    wifi_softap_dhcps_stop();
 
     dhcp_lease.start_ip = config.network_addr;
     ip4_addr4(&dhcp_lease.start_ip) = 2;
     dhcp_lease.end_ip = config.network_addr;
     ip4_addr4(&dhcp_lease.end_ip) = 128;
     wifi_softap_set_dhcps_lease(&dhcp_lease);
-    wifi_softap_set_dhcps_lease_time(config.dhcps_lease_time); // in minutes
+    wifi_softap_set_dhcps_lease_time(config.dhcps_lease_time);
 
 #ifdef REPEATER_MODE
-    if (os_strcmp(config.ssid, WIFI_SSID) == 0) {
+    if (!connected)
+    {
         wifi_softap_dhcps_start();
         dhcps_set_DNS(&dns_ip);
     }
 #else
     wifi_softap_dhcps_start();
-
-    // Change the DNS server again
     dhcps_set_DNS(&dns_ip);
 #endif
 
-    // Enter any saved dhcp enties if they are in this network
     for (i = 0; i < config.dhcps_entries; i++)
     {
-        if ((config.network_addr.addr & info.netmask.addr) == (config.dhcps_p[i].ip.addr & info.netmask.addr))
-            dhcps_set_mapping(&config.dhcps_p[i].ip, &config.dhcps_p[i].mac[0], 100000 /* several month */);
+        if ((config.network_addr.addr & info.netmask.addr) ==
+            (config.dhcps_p[i].ip.addr & info.netmask.addr))
+            dhcps_set_mapping(&config.dhcps_p[i].ip, &config.dhcps_p[i].mac[0], 100000);
     }
 }
 
@@ -4052,11 +4630,21 @@ void ICACHE_FLASH_ATTR user_set_wpa2_config()
 void ICACHE_FLASH_ATTR user_set_station_config(void)
 {
     struct station_config stationConf;
-    //char hostname[40];
+    char hostname[32];
+    uint16_t ssid_len = (uint16_t)os_strlen(config.ssid);
+    uint16_t password_len = (uint16_t)os_strlen(config.password);
+    uint16_t hostname_len = (uint16_t)os_strlen(config.sta_hostname);
 
-    /* Setup AP credentials */
-    os_sprintf(stationConf.ssid, "%s", config.ssid);
-    os_sprintf(stationConf.password, "%s", config.password);
+    os_memset(&stationConf, 0, sizeof(stationConf));
+
+    if (ssid_len >= sizeof(stationConf.ssid))
+        ssid_len = sizeof(stationConf.ssid) - 1;
+    os_memcpy(stationConf.ssid, config.ssid, ssid_len);
+
+    if (password_len >= sizeof(stationConf.password))
+        password_len = sizeof(stationConf.password) - 1;
+    os_memcpy(stationConf.password, config.password, password_len);
+
     if (*(int *)config.bssid != 0)
     {
         stationConf.bssid_set = 1;
@@ -4068,11 +4656,16 @@ void ICACHE_FLASH_ATTR user_set_station_config(void)
     }
     wifi_station_set_config(&stationConf);
 
-    wifi_station_set_hostname(config.sta_hostname);
+    if (hostname_len >= sizeof(hostname))
+        hostname_len = sizeof(hostname) - 1;
+    os_memset(hostname, 0, sizeof(hostname));
+    os_memcpy(hostname, config.sta_hostname, hostname_len);
+    wifi_station_set_hostname(hostname);
 
     wifi_set_event_handler_cb(wifi_handle_event_cb);
-
     wifi_station_set_auto_connect(config.auto_connect != 0);
+    /* Keep the Wi-Fi radio awake for predictable throughput/latency. */
+    wifi_set_sleep_type(NONE_SLEEP_T);
 }
 
 #if MQTT_CLIENT
@@ -4236,6 +4829,7 @@ void ICACHE_FLASH_ATTR user_init()
     connected = false;
     do_ip_config = false;
     my_ip.addr = 0;
+    my_gw.addr = 0;
     Bytes_in = Bytes_out = Bytes_in_last = Bytes_out_last = 0,
     Packets_in = Packets_out = Packets_in_last = Packets_out_last = 0;
     t_old = 0;

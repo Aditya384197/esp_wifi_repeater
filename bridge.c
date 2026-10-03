@@ -34,7 +34,8 @@ static netif_output_fn      s_orig_output_sta;
 static netif_output_fn      s_orig_output_ap;
 static netif_linkoutput_fn  s_orig_lo_sta;
 static netif_linkoutput_fn  s_orig_lo_ap;
-static bool                 s_bridge_inited;
+static bool                  s_bridge_hooks_installed;
+static bool                  s_bridge_active;
 
 /* -------------------------------------------------------------------------
  * Compact packed header types
@@ -120,8 +121,8 @@ static uint32_t ICACHE_FLASH_ATTR now_secs(void)
  * Forwarding Database (FDB)
  * ------------------------------------------------------------------------- */
 
-#define FDB_SIZE   32
-#define FDB_TTL_S 7200
+#define FDB_SIZE   16
+#define FDB_TTL_S 600
 
 typedef struct {
     uint32_t ip;
@@ -131,25 +132,50 @@ typedef struct {
 
 static fdb_entry_t s_fdb[FDB_SIZE];
 
-static void ICACHE_FLASH_ATTR fdb_insert(uint32_t ip, const uint8_t *mac)
+static void ICACHE_FLASH_ATTR fdb_insert_ttl(uint32_t ip, const uint8_t *mac, uint32_t ttl_s)
 {
-    if (ip == 0) return;
-    if (s_sta_nif && ip == s_sta_nif->ip_addr.addr) return;
-    if (s_ap_nif  && ip == s_ap_nif->ip_addr.addr)  return;
-    uint32_t now = now_secs();
+    uint32_t now;
     int free_idx = -1, oldest_idx = 0;
     uint32_t oldest_exp = 0xFFFFFFFFUL;
     int i;
-    for (i = 0; i < FDB_SIZE; i++) {
-        if (s_fdb[i].ip == ip) {
-            os_memcpy(s_fdb[i].mac, mac, 6); s_fdb[i].expires_s = now + FDB_TTL_S;
+
+    if (ip == 0 || mac == NULL) return;
+    if (s_sta_nif && ip == s_sta_nif->ip_addr.addr) return;
+    if (s_ap_nif && ip == s_ap_nif->ip_addr.addr) return;
+    if (ttl_s == 0) ttl_s = FDB_TTL_S;
+    if (ttl_s > 86400UL * 7UL) ttl_s = 86400UL * 7UL;
+
+    now = now_secs();
+    for (i = 0; i < FDB_SIZE; i++)
+    {
+        if (s_fdb[i].ip == ip)
+        {
+            os_memcpy(s_fdb[i].mac, mac, 6);
+            s_fdb[i].expires_s = now + ttl_s;
             return;
         }
-        if (s_fdb[i].ip == 0 || s_fdb[i].expires_s <= now) { if (free_idx < 0) free_idx = i; }
-        if (s_fdb[i].expires_s < oldest_exp) { oldest_exp = s_fdb[i].expires_s; oldest_idx = i; }
+        if (s_fdb[i].ip == 0 || s_fdb[i].expires_s <= now)
+        {
+            if (free_idx < 0) free_idx = i;
+        }
+        if (s_fdb[i].expires_s < oldest_exp)
+        {
+            oldest_exp = s_fdb[i].expires_s;
+            oldest_idx = i;
+        }
     }
-    int idx = (free_idx >= 0) ? free_idx : oldest_idx;
-    s_fdb[idx].ip = ip; os_memcpy(s_fdb[idx].mac, mac, 6); s_fdb[idx].expires_s = now + FDB_TTL_S;
+
+    {
+        int idx = (free_idx >= 0) ? free_idx : oldest_idx;
+        s_fdb[idx].ip = ip;
+        os_memcpy(s_fdb[idx].mac, mac, 6);
+        s_fdb[idx].expires_s = now + ttl_s;
+    }
+}
+
+static void ICACHE_FLASH_ATTR fdb_insert(uint32_t ip, const uint8_t *mac)
+{
+    fdb_insert_ttl(ip, mac, FDB_TTL_S);
 }
 
 static const uint8_t * ICACHE_FLASH_ATTR fdb_lookup(uint32_t ip)
@@ -229,12 +255,25 @@ static void ICACHE_FLASH_ATTR update_ip_chksum(ip_hdr_t *ip)
 static uint8_t * ICACHE_FLASH_ATTR dhcp_find_option(uint8_t *opts, uint16_t opts_len, uint8_t tag, uint8_t *out_len)
 {
     uint16_t i = 0;
-    while (i < opts_len) {
-        if (opts[i] == 255) { if (tag == 255) return &opts[i]; break; }
-        if (opts[i] == 0)  { i++; continue; } 
-        uint8_t t = opts[i], l = (i + 1 < opts_len) ? opts[i + 1] : 0;
-        if (t == tag) { if (out_len) *out_len = l; return &opts[i + 2]; }
-        i += 2 + l;
+    while (i < opts_len)
+    {
+        uint8_t t = opts[i];
+        if (t == 255)
+            return tag == 255 ? &opts[i] : NULL;
+        if (t == 0)
+        {
+            i++;
+            continue;
+        }
+        if (i + 1 >= opts_len) return NULL;
+        uint8_t l = opts[i + 1];
+        if ((uint16_t)(i + 2 + l) > opts_len) return NULL;
+        if (t == tag)
+        {
+            if (out_len) *out_len = l;
+            return &opts[i + 2];
+        }
+        i = (uint16_t)(i + 2 + l);
     }
     return NULL;
 }
@@ -302,28 +341,42 @@ static void ICACHE_FLASH_ATTR snoop_dhcp_request(struct pbuf *p, uint16_t eth_ip
 static bool ICACHE_FLASH_ATTR snoop_dhcp_reply(struct pbuf *p, uint16_t eth_ip_udp_hdr_len, uint8_t chaddr_out[6])
 {
     dhcp_msg_t *dhcp = (dhcp_msg_t *)pkt_at(p, eth_ip_udp_hdr_len, sizeof(dhcp_msg_t));
-    if (!dhcp || dhcp->op != DHCP_OP_REPLY || dhcp->hlen != 6 || dhcp->magic != htonl(DHCP_MAGIC_COOKIE)) return false;
+    if (!dhcp || dhcp->op != DHCP_OP_REPLY || dhcp->hlen != 6 ||
+        dhcp->magic != htonl(DHCP_MAGIC_COOKIE)) return false;
 
     const uint8_t *orig_mac = xid_map_lookup(dhcp->xid);
-    if (orig_mac) {
-        os_memcpy(chaddr_out, orig_mac, 6); os_memcpy(dhcp->chaddr, orig_mac, 6);
+    if (orig_mac)
+    {
+        os_memcpy(chaddr_out, orig_mac, 6);
+        os_memcpy(dhcp->chaddr, orig_mac, 6);
         udp_hdr_t *udp = (udp_hdr_t *)pkt_at(p, eth_ip_udp_hdr_len - (uint16_t)sizeof(udp_hdr_t), sizeof(udp_hdr_t));
         if (udp) udp->chksum = 0;
-    } else { os_memcpy(chaddr_out, dhcp->chaddr, 6); }
+    }
+    else
+    {
+        os_memcpy(chaddr_out, dhcp->chaddr, 6);
+    }
 
-    if (dhcp->yiaddr != 0) {
+    /* DHCP replies for the ESP's own station lease belong to lwIP, not to an
+       AP client. Consuming them here can make the uplink lease appear flaky. */
+    if (s_sta_nif && os_memcmp(chaddr_out, s_sta_nif->hwaddr, 6) == 0)
+        return false;
+
+    if (dhcp->yiaddr != 0)
+    {
         uint16_t opts_len = p->len - eth_ip_udp_hdr_len - (uint16_t)sizeof(dhcp_msg_t);
         uint8_t msg_type = 0, optlen;
         uint8_t *opt = dhcp_find_option(dhcp->options, opts_len, 53, &optlen);
-        if (opt && optlen >= 1 && opt[0] == DHCP_MSG_ACK) {
+        if (opt && optlen >= 1 && opt[0] == DHCP_MSG_ACK)
+        {
             uint32_t ttl = FDB_TTL_S;
             opt = dhcp_find_option(dhcp->options, opts_len, 51, &optlen);
-            if (opt && optlen >= 4) {
-                ttl = ((uint32_t)opt[0] << 24) | ((uint32_t)opt[1] << 16) | ((uint32_t)opt[2] << 8) | (uint32_t)opt[3];
-                if (ttl == 0 || ttl > 86400 * 7) ttl = FDB_TTL_S;
-            }
-            fdb_insert(dhcp->yiaddr, chaddr_out);
+            if (opt && optlen >= 4)
+                ttl = ((uint32_t)opt[0] << 24) | ((uint32_t)opt[1] << 16) |
+                      ((uint32_t)opt[2] << 8) | (uint32_t)opt[3];
+            fdb_insert_ttl(dhcp->yiaddr, chaddr_out, ttl);
         }
+        (void)msg_type;
     }
     return true;
 }
@@ -490,35 +543,71 @@ static void ICACHE_FLASH_ATTR handle_ap_mdns_query(struct pbuf *q, uint16_t udp_
  * Hooks
  * ------------------------------------------------------------------------- */
 
+static inline bool ICACHE_FLASH_ATTR bridge_is_multicast(const eth_hdr_t *eth)
+{
+    return (eth->dst[0] & 0x01) != 0;
+}
+
+static void ICACHE_FLASH_ATTR bridge_count_out(uint16_t len)
+{
+    Bytes_out += len;
+    Packets_out++;
+#if DAILY_LIMIT
+    Bytes_per_day += len;
+#endif
+}
+
+static void ICACHE_FLASH_ATTR bridge_count_in(uint16_t len)
+{
+    Bytes_in += len;
+    Packets_in++;
+#if DAILY_LIMIT
+    Bytes_per_day += len;
+#endif
+}
+
 static err_t ICACHE_FLASH_ATTR bridge_output_sta(struct netif *netif, struct pbuf *p, ip_addr_t *ipaddr)
 {
-    const uint8_t *client_mac = fdb_lookup(ipaddr->addr);
-    if (client_mac && pbuf_header(p, sizeof(eth_hdr_t)) == 0) {
-        eth_hdr_t *eth = (eth_hdr_t *)p->payload;
-        os_memcpy(eth->dst, client_mac, 6); os_memcpy(eth->src, s_ap_nif->hwaddr, 6); eth->type = htons(ETHTYPE_IP);
+    if (!s_bridge_active)
+        return s_orig_output_sta(netif, p, ipaddr);
 
-        Bytes_out += p->tot_len;
-        Packets_out++;
-#if DAILY_LIMIT
-        Bytes_per_day += p->tot_len;
-#endif
+    if (ipaddr != NULL)
+    {
+        const uint8_t *client_mac = fdb_lookup(ipaddr->addr);
+        if (client_mac && pbuf_header(p, sizeof(eth_hdr_t)) == 0)
+        {
+            eth_hdr_t *eth = (eth_hdr_t *)p->payload;
+            os_memcpy(eth->dst, client_mac, 6);
+            os_memcpy(eth->src, s_ap_nif->hwaddr, 6);
+            eth->type = htons(ETHTYPE_IP);
+            bridge_count_out(p->tot_len);
+            err_t err = s_orig_lo_ap(s_ap_nif, p);
+            pbuf_header(p, -(s16_t)sizeof(eth_hdr_t));
+            return err;
+        }
 
-        err_t err = s_orig_lo_ap(s_ap_nif, p);
-        pbuf_header(p, -(s16_t)sizeof(eth_hdr_t)); return err;
-    }
-
-    /* IP multicast (224.0.0.0/4): copy to AP side with the standard
-       01:00:5e multicast MAC before also forwarding upstream. */
-    uint32_t hip = ntohl(ipaddr->addr);
-    if ((hip >> 28) == 0xE && pbuf_header(p, sizeof(eth_hdr_t)) == 0) {
-        eth_hdr_t *eth = (eth_hdr_t *)p->payload;
-        eth->dst[0] = 0x01; eth->dst[1] = 0x00; eth->dst[2] = 0x5e;
-        eth->dst[3] = (uint8_t)((hip >> 16) & 0x7f);
-        eth->dst[4] = (uint8_t)((hip >>  8) & 0xff);
-        eth->dst[5] = (uint8_t)( hip        & 0xff);
-        os_memcpy(eth->src, s_ap_nif->hwaddr, 6); eth->type = htons(ETHTYPE_IP);
-        s_orig_lo_ap(s_ap_nif, p);
-        pbuf_header(p, -(s16_t)sizeof(eth_hdr_t));
+        /* Locally generated IPv4 multicast must reach AP clients as well as
+           the upstream network. Copy only this exceptional traffic; ordinary
+           unicast stays allocation-free. */
+        uint32_t hip = ntohl(ipaddr->addr);
+        if ((hip >> 28) == 0xE && pbuf_header(p, sizeof(eth_hdr_t)) == 0)
+        {
+            struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
+            if (q)
+            {
+                pbuf_copy(q, p);
+                eth_hdr_t *ethq = (eth_hdr_t *)q->payload;
+                ethq->dst[0] = 0x01; ethq->dst[1] = 0x00; ethq->dst[2] = 0x5e;
+                ethq->dst[3] = (uint8_t)((hip >> 16) & 0x7f);
+                ethq->dst[4] = (uint8_t)((hip >> 8) & 0xff);
+                ethq->dst[5] = (uint8_t)(hip & 0xff);
+                os_memcpy(ethq->src, s_ap_nif->hwaddr, 6);
+                ethq->type = htons(ETHTYPE_IP);
+                s_orig_lo_ap(s_ap_nif, q);
+                pbuf_free(q);
+            }
+            pbuf_header(p, -(s16_t)sizeof(eth_hdr_t));
+        }
     }
 
     return s_orig_output_sta(netif, p, ipaddr);
@@ -526,232 +615,341 @@ static err_t ICACHE_FLASH_ATTR bridge_output_sta(struct netif *netif, struct pbu
 
 static err_t ICACHE_FLASH_ATTR bridge_output_ap(struct netif *netif, struct pbuf *p, ip_addr_t *ipaddr)
 {
-    const uint8_t *client_mac = fdb_lookup(ipaddr->addr);
-    if (client_mac && pbuf_header(p, sizeof(eth_hdr_t)) == 0) {
-        eth_hdr_t *eth = (eth_hdr_t *)p->payload;
-        os_memcpy(eth->dst, client_mac, 6); os_memcpy(eth->src, s_ap_nif->hwaddr, 6); eth->type = htons(ETHTYPE_IP);
-        err_t err = s_orig_lo_ap(s_ap_nif, p);
-        pbuf_header(p, -(s16_t)sizeof(eth_hdr_t)); return err;
+    if (!s_bridge_active)
+        return s_orig_output_ap(netif, p, ipaddr);
+
+    if (ipaddr != NULL)
+    {
+        const uint8_t *client_mac = fdb_lookup(ipaddr->addr);
+        if (client_mac && pbuf_header(p, sizeof(eth_hdr_t)) == 0)
+        {
+            eth_hdr_t *eth = (eth_hdr_t *)p->payload;
+            os_memcpy(eth->dst, client_mac, 6);
+            os_memcpy(eth->src, s_ap_nif->hwaddr, 6);
+            eth->type = htons(ETHTYPE_IP);
+            err_t err = s_orig_lo_ap(s_ap_nif, p);
+            pbuf_header(p, -(s16_t)sizeof(eth_hdr_t));
+            return err;
+        }
     }
+
     return s_orig_output_sta(s_sta_nif, p, ipaddr);
 }
 
 static err_t ICACHE_FLASH_ATTR bridge_input_ap(struct pbuf *p, struct netif *inp)
 {
-    if (os_strcmp(config.ssid, WIFI_SSID) == 0) return s_orig_input_ap(p, inp);
+    eth_hdr_t *eth;
+    bool is_bcast;
+    bool is_to_ap_mac;
+    uint16_t eth_type;
+    const uint8_t *src_mac;
 
-    if (config.status_led <= 16)
-        easygpio_outputSet(config.status_led, 1);
+    if (!s_bridge_active || p == NULL || p->tot_len < sizeof(eth_hdr_t))
+        return s_orig_input_ap(p, inp);
 
-    struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len + 16, PBUF_RAM);
+    eth = (eth_hdr_t *)p->payload;
+    is_bcast = bridge_is_multicast(eth);
+    is_to_ap_mac = (os_memcmp(eth->dst, s_ap_nif->hwaddr, 6) == 0);
+    eth_type = ntohs(eth->type);
+    src_mac = eth->src;
 
-    Bytes_out += p->tot_len;
-    Packets_out++;
-#if DAILY_LIMIT
-    Bytes_per_day += p->tot_len;
-#endif
+    bridge_count_out(p->tot_len);
 
-    if (!q) return s_orig_input_ap(p, inp);
-    pbuf_copy(q, p);
-
-    eth_hdr_t *eth = (eth_hdr_t *)q->payload;
-    bool is_bcast = (eth->dst[0] & 0x01) != 0, is_to_ap_mac = (os_memcmp(eth->dst, s_ap_nif->hwaddr, 6) == 0);
-    uint16_t eth_type = ntohs(eth->type);
-
-    /* Learn source IP→MAC before any early return so replies to the management
-       address (which take the is_to_ap_mac path) can be routed back via the FDB. */
+    /* Learn the AP client's IP before any forwarding/local-delivery decision. */
+    if (eth_type == ETHTYPE_ARP)
     {
-        const uint8_t *src_mac = ((eth_hdr_t *)p->payload)->src;
-        if (eth_type == ETHTYPE_ARP) {
-            arp_hdr_t *arp = (arp_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
-            if (arp) fdb_insert(arp->spa, src_mac);
-        } else if (eth_type == ETHTYPE_IP) {
-            ip_hdr_t *ip = (ip_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
-            if (ip) fdb_insert(ip->src, src_mac);
-        }
-    }
-
-    if (is_to_ap_mac && !is_bcast) { pbuf_free(q); return s_orig_input_ap(p, inp); }
-
-    bool handled = false;
-    os_memcpy(eth->src, s_sta_nif->hwaddr, 6);
-
-    if (eth_type == ETHTYPE_ARP) {
-        arp_hdr_t *arp = (arp_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
-        if (arp) {
-            fdb_insert(arp->spa, ((eth_hdr_t*)p->payload)->src);
-            if (ntohs(arp->op) == 1 && s_sta_nif->ip_addr.addr != 0 && arp->tpa == s_sta_nif->ip_addr.addr) {
-                send_proxy_arp_reply(s_ap_nif, s_orig_lo_ap, arp, s_sta_nif->ip_addr.addr); handled = true;
-            } else {
-                os_memcpy(arp->sha, s_sta_nif->hwaddr, 6); s_orig_lo_sta(s_sta_nif, q); handled = true;
-            }
-        }
-    } else if (eth_type == ETHTYPE_IP) {
-        ip_hdr_t *ip = (ip_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
-        if (ip) {
-            fdb_insert(ip->src, ((eth_hdr_t*)p->payload)->src);
-            if (ip->proto == 17) {
-                uint16_t udp_off = sizeof(eth_hdr_t) + (ip->vhl & 0x0f) * 4;
-                udp_hdr_t *udp = (udp_hdr_t *)pkt_at(q, udp_off, sizeof(udp_hdr_t));
-                if (udp && ntohs(udp->dst_port) == 67) snoop_dhcp_request(q, udp_off + sizeof(udp_hdr_t));
-                if (udp && ntohs(udp->dst_port) == 5353)
-                    handle_ap_mdns_query(q, udp_off, ((eth_hdr_t *)p->payload)->src);
-            }
-            s_orig_lo_sta(s_sta_nif, q); handled = true;
-        }
-    } else { s_orig_lo_sta(s_sta_nif, q); handled = true; }
-
-    pbuf_free(q);
-    if (is_bcast) return s_orig_input_ap(p, inp);
-
-    if (handled) { pbuf_free(p); return ERR_OK; }
-    return s_orig_input_ap(p, inp);
-}
-
-static err_t ICACHE_FLASH_ATTR bridge_input_sta(struct pbuf *p, struct netif *inp)
-{
-    struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
-
-    Bytes_in += p->tot_len;
-    Packets_in++;
-#if DAILY_LIMIT
-    Bytes_per_day += p->tot_len;
-#endif
-    if (config.status_led <= 16)
-        easygpio_outputSet(config.status_led, 0);
-        
-    if (!q) return s_orig_input_sta(p, inp);
-    pbuf_copy(q, p);
-
-    eth_hdr_t *eth = (eth_hdr_t *)q->payload;
-    if (os_memcmp(eth->src, s_ap_nif->hwaddr, 6) == 0) { pbuf_free(q); return s_orig_input_sta(p, inp); }
-
-    uint16_t eth_type = ntohs(eth->type);
-    bool is_bcast = (eth->dst[0] & 0x01) != 0, is_to_sta_mac = (os_memcmp(eth->dst, s_sta_nif->hwaddr, 6) == 0);
-    bool handled = false;
-    os_memcpy(eth->src, s_ap_nif->hwaddr, 6);
-
-    if (eth_type == ETHTYPE_IP) {
-        ip_hdr_t *ip = (ip_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
-        if (ip) {
-            uint8_t ch[6]; bool have_dhcp = false;
-            if (ip->proto == 17) {
-                uint16_t udp_off = sizeof(eth_hdr_t) + (ip->vhl & 0x0f) * 4;
-                udp_hdr_t *udp = (udp_hdr_t *)pkt_at(q, udp_off, sizeof(udp_hdr_t));
-                if (udp && ntohs(udp->src_port) == 67 && ntohs(udp->dst_port) == 68) have_dhcp = snoop_dhcp_reply(q, udp_off + sizeof(udp_hdr_t), ch);
-            }
-            const uint8_t *mac = NULL;
-            if (have_dhcp) mac = ch; else if (!is_bcast) { if (s_sta_nif->ip_addr.addr && ip->dst != s_sta_nif->ip_addr.addr) mac = fdb_lookup(ip->dst); }
-            if (is_bcast || mac) {
-                if (mac) os_memcpy(eth->dst, mac, 6);
-                s_orig_lo_ap(s_ap_nif, q); handled = true;
-            }
-        }
-    } else if (eth_type == ETHTYPE_ARP) {
-        arp_hdr_t *arp = (arp_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
-        if (arp) {
-            if (ntohs(arp->op) == 1 && fdb_lookup(arp->tpa)) {
-                send_proxy_arp_reply(s_sta_nif, s_orig_lo_sta, arp, arp->tpa);
-                handled = true; pbuf_free(q); pbuf_free(p); return ERR_OK;
-            }
-            os_memcpy(arp->sha, s_ap_nif->hwaddr, 6);
-            const uint8_t *mac = NULL;
-            if (!is_bcast) { if (s_sta_nif->ip_addr.addr && arp->tpa != s_sta_nif->ip_addr.addr) mac = fdb_lookup(arp->tpa); }
-            if (is_bcast || mac) {
-                if (mac) { os_memcpy(eth->dst, mac, 6); os_memcpy(arp->tha, mac, 6); }
-                s_orig_lo_ap(s_ap_nif, q); handled = true;
-            }
-        }
-    }
-    
-    pbuf_free(q);
-
-    if (is_bcast || (is_to_sta_mac && !handled)) return s_orig_input_sta(p, inp);
-    pbuf_free(p); return ERR_OK;
-}
-/*
-static err_t ICACHE_FLASH_ATTR bridge_input_sta(struct pbuf *p, struct netif *inp)
-{
- //   struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
- //   if (!q) return s_orig_input_sta(p, inp);
- //   pbuf_copy(q, p);
-
-    eth_hdr_t *eth = (eth_hdr_t *)p->payload;
-    if (os_memcmp(eth->src, s_ap_nif->hwaddr, 6) == 0) { return s_orig_input_sta(p, inp); }
-
-    uint16_t eth_type = ntohs(eth->type);
-    bool is_bcast = (eth->dst[0] & 0x01) != 0, is_to_sta_mac = (os_memcmp(eth->dst, s_sta_nif->hwaddr, 6) == 0);
-    bool handled = false;
-    os_memcpy(eth->src, s_ap_nif->hwaddr, 6);
-
-    if (eth_type == ETHTYPE_IP) {
-        ip_hdr_t *ip = (ip_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
-        if (ip) {
-            uint8_t ch[6]; bool have_dhcp = false;
-            if (ip->proto == 17) {
-                uint16_t udp_off = sizeof(eth_hdr_t) + (ip->vhl & 0x0f) * 4;
-                udp_hdr_t *udp = (udp_hdr_t *)pkt_at(p, udp_off, sizeof(udp_hdr_t));
-                if (udp && ntohs(udp->src_port) == 67 && ntohs(udp->dst_port) == 68) have_dhcp = snoop_dhcp_reply(p, udp_off + sizeof(udp_hdr_t), ch);
-            }
-            const uint8_t *mac = NULL;
-            if (have_dhcp) mac = ch; else if (!is_bcast) { if (s_sta_nif->ip_addr.addr && ip->dst != s_sta_nif->ip_addr.addr) mac = fdb_lookup(ip->dst); }
-            if (is_bcast || mac) {
-                if (mac) os_memcpy(eth->dst, mac, 6);
-                s_orig_lo_ap(s_ap_nif, p); handled = true;
-            }
-        }
-    } else if (eth_type == ETHTYPE_ARP) {
         arp_hdr_t *arp = (arp_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
-        if (arp) {
-            if (ntohs(arp->op) == 1 && fdb_lookup(arp->tpa)) {
-                send_proxy_arp_reply(s_sta_nif, s_orig_lo_sta, arp, arp->tpa);
-                handled = true; pbuf_free(p); return ERR_OK;
+        if (arp) fdb_insert(arp->spa, src_mac);
+    }
+    else if (eth_type == ETHTYPE_IP)
+    {
+        ip_hdr_t *ip = (ip_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
+        if (ip) fdb_insert(ip->src, src_mac);
+    }
+
+    /* Frames explicitly addressed to the ESP AP interface are local. */
+    if (is_to_ap_mac && !is_bcast)
+        return s_orig_input_ap(p, inp);
+
+    if (is_bcast)
+    {
+        /* Broadcast/multicast has two consumers: upstream and local lwIP.
+           Only this path allocates a second pbuf. */
+        struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len + 16, PBUF_RAM);
+        if (q == NULL)
+            return s_orig_input_ap(p, inp);
+
+        pbuf_copy(q, p);
+        eth_hdr_t *qeth = (eth_hdr_t *)q->payload;
+        os_memcpy(qeth->src, s_sta_nif->hwaddr, 6);
+
+        if (eth_type == ETHTYPE_ARP)
+        {
+            arp_hdr_t *arp = (arp_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
+            if (arp)
+            {
+                if (ntohs(arp->op) == 1 && s_sta_nif->ip_addr.addr != 0 && arp->tpa == s_sta_nif->ip_addr.addr)
+                {
+                    /* send_proxy_arp_reply() reads the request, so q must stay
+                       alive until after the reply has been constructed/sent. */
+                    send_proxy_arp_reply(s_ap_nif, s_orig_lo_ap, arp, s_sta_nif->ip_addr.addr);
+                    pbuf_free(q);
+                    pbuf_free(p);
+                    return ERR_OK;
+                }
+                os_memcpy(arp->sha, s_sta_nif->hwaddr, 6);
+                s_orig_lo_sta(s_sta_nif, q);
             }
-            os_memcpy(arp->sha, s_ap_nif->hwaddr, 6);
-            const uint8_t *mac = NULL;
-            if (!is_bcast) { if (s_sta_nif->ip_addr.addr && arp->tpa != s_sta_nif->ip_addr.addr) mac = fdb_lookup(arp->tpa); }
-            if (is_bcast || mac) {
-                if (mac) { os_memcpy(eth->dst, mac, 6); os_memcpy(arp->tha, mac, 6); }
-                s_orig_lo_ap(s_ap_nif, p); handled = true;
+            else
+                pbuf_free(q);
+        }
+        else if (eth_type == ETHTYPE_IP)
+        {
+            ip_hdr_t *ip = (ip_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
+            if (ip)
+            {
+                uint16_t udp_off = sizeof(eth_hdr_t) + (uint16_t)((ip->vhl & 0x0f) * 4);
+                if (ip->proto == 17)
+                {
+                    udp_hdr_t *udp = (udp_hdr_t *)pkt_at(q, udp_off, sizeof(udp_hdr_t));
+                    if (udp && ntohs(udp->dst_port) == 67)
+                        snoop_dhcp_request(q, udp_off + sizeof(udp_hdr_t));
+                    if (udp && ntohs(udp->dst_port) == 5353)
+                        handle_ap_mdns_query(q, udp_off, src_mac);
+                }
+                s_orig_lo_sta(s_sta_nif, q);
+            }
+            else
+                pbuf_free(q);
+        }
+        else
+            s_orig_lo_sta(s_sta_nif, q);
+
+        pbuf_free(q);
+
+        return s_orig_input_ap(p, inp);
+    }
+
+    /* Ordinary unicast forwarding: mutate the original pbuf in place. This is
+       the high-rate path and avoids a heap allocation/copy per packet. */
+    {
+        uint8_t old_src[6];
+        os_memcpy(old_src, eth->src, 6);
+        os_memcpy(eth->src, s_sta_nif->hwaddr, 6);
+
+        if (eth_type == ETHTYPE_ARP)
+        {
+            arp_hdr_t *arp = (arp_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
+            if (arp)
+            {
+                if (ntohs(arp->op) == 1 && s_sta_nif->ip_addr.addr != 0 && arp->tpa == s_sta_nif->ip_addr.addr)
+                {
+                    os_memcpy(eth->src, old_src, 6);
+                    send_proxy_arp_reply(s_ap_nif, s_orig_lo_ap, arp, s_sta_nif->ip_addr.addr);
+                    pbuf_free(p);
+                    return ERR_OK;
+                }
+                os_memcpy(arp->sha, s_sta_nif->hwaddr, 6);
+            }
+        }
+        else if (eth_type == ETHTYPE_IP)
+        {
+            ip_hdr_t *ip = (ip_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
+            if (ip && ip->proto == 17)
+            {
+                uint16_t udp_off = sizeof(eth_hdr_t) + (uint16_t)((ip->vhl & 0x0f) * 4);
+                udp_hdr_t *udp = (udp_hdr_t *)pkt_at(p, udp_off, sizeof(udp_hdr_t));
+                if (udp && ntohs(udp->dst_port) == 67)
+                    snoop_dhcp_request(p, udp_off + sizeof(udp_hdr_t));
+            }
+        }
+
+        s_orig_lo_sta(s_sta_nif, p);
+        os_memcpy(eth->src, old_src, 6);
+    }
+
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+static err_t ICACHE_FLASH_ATTR bridge_input_sta(struct pbuf *p, struct netif *inp)
+{
+    eth_hdr_t *eth;
+    bool is_bcast;
+    bool is_to_sta_mac;
+    uint16_t eth_type;
+    const uint8_t *src_mac;
+
+    if (!s_bridge_active || p == NULL || p->tot_len < sizeof(eth_hdr_t))
+        return s_orig_input_sta(p, inp);
+
+    eth = (eth_hdr_t *)p->payload;
+    is_bcast = bridge_is_multicast(eth);
+    is_to_sta_mac = (os_memcmp(eth->dst, s_sta_nif->hwaddr, 6) == 0);
+    eth_type = ntohs(eth->type);
+    src_mac = eth->src;
+
+    bridge_count_in(p->tot_len);
+
+    if (eth_type == ETHTYPE_IP)
+    {
+        ip_hdr_t *ip = (ip_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
+        if (ip) fdb_insert(ip->src, src_mac);
+    }
+    else if (eth_type == ETHTYPE_ARP)
+    {
+        arp_hdr_t *arp = (arp_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
+        if (arp) fdb_insert(arp->spa, src_mac);
+    }
+
+    if (is_bcast)
+    {
+        struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
+        if (q)
+        {
+            pbuf_copy(q, p);
+            eth_hdr_t *qeth = (eth_hdr_t *)q->payload;
+            os_memcpy(qeth->src, s_ap_nif->hwaddr, 6);
+
+            if (eth_type == ETHTYPE_IP)
+            {
+                ip_hdr_t *ip = (ip_hdr_t *)pkt_at(q, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
+                if (ip && ip->proto == 17)
+                {
+                    uint16_t udp_off = sizeof(eth_hdr_t) + (uint16_t)((ip->vhl & 0x0f) * 4);
+                    udp_hdr_t *udp = (udp_hdr_t *)pkt_at(q, udp_off, sizeof(udp_hdr_t));
+                    if (udp && ntohs(udp->src_port) == 67 && ntohs(udp->dst_port) == 68)
+                    {
+                        uint8_t client_mac[6];
+                        if (snoop_dhcp_reply(q, udp_off + sizeof(udp_hdr_t), client_mac))
+                        {
+                            os_memcpy(qeth->dst, client_mac, 6);
+                        }
+                    }
+                }
+            }
+
+            s_orig_lo_ap(s_ap_nif, q);
+            pbuf_free(q);
+        }
+        return s_orig_input_sta(p, inp);
+    }
+
+    if (eth_type == ETHTYPE_ARP)
+    {
+        arp_hdr_t *arp = (arp_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(arp_hdr_t));
+        if (arp)
+        {
+            const uint8_t *client_mac = fdb_lookup(arp->tpa);
+            if (ntohs(arp->op) == 1 && client_mac)
+            {
+                send_proxy_arp_reply(s_sta_nif, s_orig_lo_sta, arp, arp->tpa);
+                pbuf_free(p);
+                return ERR_OK;
+            }
+
+            if (is_to_sta_mac)
+                return s_orig_input_sta(p, inp);
+
+            if (client_mac)
+            {
+                uint8_t old_src[6];
+                os_memcpy(old_src, eth->src, 6);
+                os_memcpy(eth->dst, client_mac, 6);
+                os_memcpy(eth->src, s_ap_nif->hwaddr, 6);
+                os_memcpy(arp->sha, s_ap_nif->hwaddr, 6);
+                os_memcpy(arp->tha, client_mac, 6);
+                s_orig_lo_ap(s_ap_nif, p);
+                os_memcpy(eth->src, old_src, 6);
+                pbuf_free(p);
+                return ERR_OK;
             }
         }
     }
-    
-    if (is_bcast || (is_to_sta_mac && !handled)) return s_orig_input_sta(p, inp);
-    pbuf_free(p); return ERR_OK;
+    else if (eth_type == ETHTYPE_IP)
+    {
+        ip_hdr_t *ip = (ip_hdr_t *)pkt_at(p, sizeof(eth_hdr_t), sizeof(ip_hdr_t));
+        if (ip)
+        {
+            uint8_t client_mac[6];
+            bool have_dhcp = false;
+            if (ip->proto == 17)
+            {
+                uint16_t udp_off = sizeof(eth_hdr_t) + (uint16_t)((ip->vhl & 0x0f) * 4);
+                udp_hdr_t *udp = (udp_hdr_t *)pkt_at(p, udp_off, sizeof(udp_hdr_t));
+                if (udp && ntohs(udp->src_port) == 67 && ntohs(udp->dst_port) == 68)
+                    have_dhcp = snoop_dhcp_reply(p, udp_off + sizeof(udp_hdr_t), client_mac);
+            }
+
+            const uint8_t *dest_mac = have_dhcp ? client_mac : fdb_lookup(ip->dst);
+            if (dest_mac && ip->dst != s_sta_nif->ip_addr.addr)
+            {
+                uint8_t old_src[6];
+                os_memcpy(old_src, eth->src, 6);
+                os_memcpy(eth->dst, dest_mac, 6);
+                os_memcpy(eth->src, s_ap_nif->hwaddr, 6);
+                s_orig_lo_ap(s_ap_nif, p);
+                os_memcpy(eth->src, old_src, 6);
+                pbuf_free(p);
+                return ERR_OK;
+            }
+        }
+    }
+
+    if (is_to_sta_mac)
+        return s_orig_input_sta(p, inp);
+
+    pbuf_free(p);
+    return ERR_OK;
 }
-*/
+
 void ICACHE_FLASH_ATTR bridge_init(struct netif *sta_nif, struct netif *ap_nif)
 {
-    /* bridge_init() is called on EVERY GOT_IP event (each reconnect to the router).
-       The hooks must be installed only once: re-saving the already patched
-       functions as "original" made the bridge call itself endlessly
-       (stack overflow -> reset -> internet drops to 0 for a while). */
-    s_sta_nif = sta_nif; s_ap_nif = ap_nif;
-    if (sta_nif->input != bridge_input_sta)      { s_orig_input_sta  = sta_nif->input;      sta_nif->input      = bridge_input_sta; }
-    if (ap_nif->input  != bridge_input_ap)       { s_orig_input_ap   = ap_nif->input;       ap_nif->input       = bridge_input_ap; }
-    if (sta_nif->output != bridge_output_sta)    { s_orig_output_sta = sta_nif->output;     sta_nif->output     = bridge_output_sta; }
-    if (ap_nif->output  != bridge_output_ap)     { s_orig_output_ap  = ap_nif->output;      ap_nif->output      = bridge_output_ap; }
-    if (s_orig_lo_sta == NULL) s_orig_lo_sta = sta_nif->linkoutput;
-    if (s_orig_lo_ap  == NULL) s_orig_lo_ap  = ap_nif->linkoutput;
-    netif_set_default(sta_nif); sta_nif->napt = 0; ap_nif->napt = 0;
+    if (sta_nif == NULL || ap_nif == NULL)
+        return;
 
-    if (!s_bridge_inited) {
-        /* keep learned clients across reconnects; clear only at first start */
-        os_memset(s_fdb, 0, sizeof(s_fdb)); os_memset(s_xid_map, 0, sizeof(s_xid_map));
-        s_bridge_inited = true;
+    s_sta_nif = sta_nif;
+    s_ap_nif = ap_nif;
+
+    if (!s_bridge_hooks_installed)
+    {
+        s_orig_input_sta = sta_nif->input;
+        s_orig_input_ap = ap_nif->input;
+        s_orig_output_sta = sta_nif->output;
+        s_orig_output_ap = ap_nif->output;
+        s_orig_lo_sta = sta_nif->linkoutput;
+        s_orig_lo_ap = ap_nif->linkoutput;
+
+        sta_nif->input = bridge_input_sta;
+        ap_nif->input = bridge_input_ap;
+        sta_nif->output = bridge_output_sta;
+        ap_nif->output = bridge_output_ap;
+        s_bridge_hooks_installed = true;
     }
 
-    /* wifi_softap_set_config() restarts the AP and kicks all clients:
-       only do it when the channel really has to change */
-    struct softap_config ap_cfg;
-    wifi_softap_get_config(&ap_cfg);
-    if (my_channel != 0 && ap_cfg.channel != my_channel) {
+    s_bridge_active = true;
+    netif_set_default(sta_nif);
+    sta_nif->napt = 0;
+    ap_nif->napt = 0;
+    os_memset(s_fdb, 0, sizeof(s_fdb));
+    os_memset(s_xid_map, 0, sizeof(s_xid_map));
+
+    {
+        struct softap_config ap_cfg;
+        wifi_softap_get_config(&ap_cfg);
         ap_cfg.channel = my_channel;
         wifi_softap_set_config(&ap_cfg);
     }
     wifi_set_sleep_type(NONE_SLEEP_T);
-    os_printf("bridge: init done\n");
+    os_printf("bridge: init done on channel %d\n", my_channel);
+}
+
+void ICACHE_FLASH_ATTR bridge_uplink_down(void)
+{
+    s_bridge_active = false;
+    os_memset(s_fdb, 0, sizeof(s_fdb));
+    os_memset(s_xid_map, 0, sizeof(s_xid_map));
+    os_printf("bridge: uplink down, AP returned to local management path\n");
 }
 
 void ICACHE_FLASH_ATTR bridge_show_fdb(void)

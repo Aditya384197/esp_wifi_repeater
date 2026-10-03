@@ -1,0 +1,40 @@
+# Place this file at: .github/workflows/build.yml
+name: Build ESP8266 WiFi Repeater
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [bridge, default]   # bridge = L2 WiFi repeater, default = NAT router
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (${{ matrix.variant }}) in martinfger/iot_devel
+        run: |
+          chmod -R a+rwX "$GITHUB_WORKSPACE"
+          docker run --rm --user root \
+            -v "$GITHUB_WORKSPACE":/home/esp/esp_wifi_repeater \
+            -w /home/esp/esp_wifi_repeater \
+            martinfger/iot_devel:1.0 \
+            bash -c "make clean && make VARIANT=${{ matrix.variant }} V=1"
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+          ls -l firmware
+          cat firmware/sha1sums
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp_wifi_repeater_${{ matrix.variant }}
+          path: |
+            firmware/0x00000.bin
+            firmware/0x02000.bin
+            firmware/0x82000.bin
+            firmware/sha1sums

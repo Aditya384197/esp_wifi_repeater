@@ -1,7 +1,7 @@
 # L2 Bridging on the ESP8266 (`VARIANT=bridge`)
 
 This document describes how the transparent layer-2 bridge between the
-upstream WiFi (STA interface) and the local soft-AP works. All bridge logic
+upstream WiFi (STA interface)and the local soft-AP works. All bridge logic
 lives in `user/bridge.c`, compiled in only when `REPEATER_MODE` is defined
 (set by `user/user_config_bridge.h`). The default `make` build still uses
 NAPT; `make VARIANT=bridge` selects the bridge.

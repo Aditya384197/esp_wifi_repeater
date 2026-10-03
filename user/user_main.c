@@ -47,7 +47,7 @@
 #include "easygpio.h"
 
 #if WEB_CONFIG
-#include "web.h"
+#include "web_ui.h"
 #endif
 
 #if ACLS
@@ -117,6 +117,7 @@ static ip_addr_t resolve_ip;
 
 uint8_t mesh_level;
 uint8_t uplink_bssid[6];
+uint8_t web_last_disc_reason; /* last STA disconnect reason (shown on web dashboard) */
 
 static netif_input_fn orig_input_ap, orig_input_sta;
 static netif_linkoutput_fn orig_output_ap, orig_output_sta;
@@ -3417,156 +3418,31 @@ static void ICACHE_FLASH_ATTR tcp_client_connected_cb(void *arg)
 #endif /* REMOTE_CONFIG */
 
 #if WEB_CONFIG
-static void ICACHE_FLASH_ATTR handle_set_cmd(void *arg, char *cmd, char *val)
+/* The web dashboard lives in web_ui.c */
+static void ICACHE_FLASH_ATTR web_config_client_recv_cb(void *arg, char *data, unsigned short length)
 {
-    struct espconn *pespconn = (struct espconn *)arg;
-    int max_current_cmd_size = MAX_CON_CMD_SIZE - (os_strlen(cmd) + 1);
-    char cmd_line[MAX_CON_CMD_SIZE + 1];
-
-    if (os_strlen(val) >= max_current_cmd_size)
-    {
-        val[max_current_cmd_size] = '\0';
-    }
-    os_sprintf(cmd_line, "%s %s", cmd, val);
-    //os_printf("web_config_client_recv_cb(): cmd line:%s\n",cmd_line);
-
-    ringbuf_memcpy_into(console_rx_buffer, cmd_line, os_strlen(cmd_line));
-    console_handle_command(pespconn);
-}
-
-char *strstr(char *string, char *needle);
-char *strtok(char *str, const char *delimiters);
-char *strtok_r(char *s, const char *delim, char **last);
-
-static void ICACHE_FLASH_ATTR web_config_client_recv_cb(void *arg,
-                                                        char *data,
-                                                        unsigned short length)
-{
-    struct espconn *pespconn = (struct espconn *)arg;
-    char *kv, *sv;
-    bool do_reset = false;
-    char *token[1];
-    char *str;
-
-    str = strstr(data, " /?");
-    if (str != NULL)
-    {
-        str = strtok(str + 3, " ");
-
-        char *keyval = strtok_r(str, "&", &kv);
-        while (keyval != NULL)
-        {
-            char *key = strtok_r(keyval, "=", &sv);
-            char *val = strtok_r(NULL, "=", &sv);
-
-            keyval = strtok_r(NULL, "&", &kv);
-            //os_printf("web_config_client_recv_cb(): key:%s:val:%s:\n",key,val);
-            if (val != NULL)
-            {
-
-                if (strcmp(key, "ssid") == 0)
-                {
-                    parse_str_into_tokens(val, token, 1);
-                    handle_set_cmd(pespconn, "set ssid", token[0]);
-                    config.automesh_mode = AUTOMESH_OFF;
-                    do_reset = true;
-                }
-                else if (strcmp(key, "password") == 0)
-                {
-                    parse_str_into_tokens(val, token, 1);
-                    handle_set_cmd(pespconn, "set password", token[0]);
-                    do_reset = true;
-                }
-                else if (strcmp(key, "am") == 0)
-                {
-                    config.automesh_mode = AUTOMESH_LEARNING;
-                    config.automesh_checked = 0;
-                    do_reset = true;
-                }
-                else if (strcmp(key, "lock") == 0)
-                {
-                    os_memcpy(config.lock_password, config.password, sizeof(config.lock_password));
-                    config.locked = 1;
-                }
-                else if (strcmp(key, "ap_ssid") == 0)
-                {
-                    parse_str_into_tokens(val, token, 1);
-                    handle_set_cmd(pespconn, "set ap_ssid", token[0]);
-                    do_reset = true;
-                }
-                else if (strcmp(key, "ap_password") == 0)
-                {
-                    parse_str_into_tokens(val, token, 1);
-                    handle_set_cmd(pespconn, "set ap_password", token[0]);
-                    do_reset = true;
-                }
-                else if (strcmp(key, "network") == 0)
-                {
-                    handle_set_cmd(pespconn, "set network", val);
-                    do_reset = true;
-                }
-                else if (strcmp(key, "unlock_password") == 0)
-                {
-                    handle_set_cmd(pespconn, "unlock", val);
-                }
-                else if (strcmp(key, "ap_open") == 0)
-                {
-                    if (strcmp(val, "wpa2") == 0)
-                    {
-                        config.ap_open = 0;
-                        do_reset = true;
-                    }
-                    if (strcmp(val, "open") == 0)
-                    {
-                        config.ap_open = 1;
-                        do_reset = true;
-                    }
-                }
-                else if (strcmp(key, "reset") == 0)
-                {
-                    do_reset = true;
-                }
-#if GPIO_CMDS
-                else if (strcmp(key, "gpio") == 0)
-                {
-                    handle_set_cmd(pespconn, "gpio", val);
-                }
-#endif
-            }
-        }
-
-        config_save(&config);
-
-        if (do_reset == true)
-        {
-            do_reset = false;
-            ringbuf_memcpy_into(console_rx_buffer, "reset", os_strlen("reset"));
-            console_handle_command(pespconn);
-        }
-    }
+    web_ui_recv(arg, data, length);
 }
 
 static void ICACHE_FLASH_ATTR web_config_client_discon_cb(void *arg)
 {
-    //os_printf("web_config_client_discon_cb(): client disconnected\n");
-    struct espconn *pespconn = (struct espconn *)arg;
+    web_ui_discon(arg);
+}
+
+static void ICACHE_FLASH_ATTR web_config_client_recon_cb(void *arg, sint8 err)
+{
+    web_ui_discon(arg);
 }
 
 static void ICACHE_FLASH_ATTR web_config_client_sent_cb(void *arg)
 {
-    //os_printf("web_config_client_sent_cb(): data sent to client\n");
-    struct espconn *pespconn = (struct espconn *)arg;
-
-    espconn_disconnect(pespconn);
+    web_ui_sent(arg);
 }
 
 /* Called when a client connects to the web config */
 static void ICACHE_FLASH_ATTR web_config_client_connected_cb(void *arg)
 {
-
     struct espconn *pespconn = (struct espconn *)arg;
-
-    //os_printf("web_config_client_connected_cb(): Client connected\r\n");
 
     if (!check_connection_access(pespconn, config.config_access))
     {
@@ -3576,53 +3452,10 @@ static void ICACHE_FLASH_ATTR web_config_client_connected_cb(void *arg)
     }
 
     espconn_regist_disconcb(pespconn, web_config_client_discon_cb);
+    espconn_regist_reconcb(pespconn, web_config_client_recon_cb);
     espconn_regist_recvcb(pespconn, web_config_client_recv_cb);
     espconn_regist_sentcb(pespconn, web_config_client_sent_cb);
-
-    ringbuf_reset(console_rx_buffer);
-    ringbuf_reset(console_tx_buffer);
-
-    if (!config.locked)
-    {
-        static const uint8_t config_page_str[] ICACHE_RODATA_ATTR STORE_ATTR = CONFIG_PAGE;
-        uint32_t slen = (sizeof(config_page_str) + 4) & ~3;
-        uint8_t *config_page = (char *)os_malloc(slen);
-        if (config_page == NULL)
-            return;
-        os_memcpy(config_page, config_page_str, slen);
-
-        uint8_t *page_buf = (char *)os_malloc(slen + 200);
-        if (page_buf == NULL)
-            return;
-        os_sprintf(page_buf, config_page, config.ssid, config.password,
-#ifndef REPEATER_MODE
-                   config.automesh_mode != AUTOMESH_OFF ? "checked" : "",
-#endif
-                   config.ap_ssid, config.ap_password,
-                   config.ap_open ? " selected" : "", config.ap_open ? "" : " selected"
-#ifndef REPEATER_MODE
-                   , IP2STR(&config.network_addr)
-#endif
-        );
-        os_free(config_page);
-
-        espconn_send(pespconn, page_buf, os_strlen(page_buf));
-
-        os_free(page_buf);
-    }
-    else
-    {
-        static const uint8_t lock_page_str[] ICACHE_RODATA_ATTR STORE_ATTR = LOCK_PAGE;
-        uint32_t slen = (sizeof(lock_page_str) + 4) & ~3;
-        uint8_t *lock_page = (char *)os_malloc(slen);
-        if (lock_page == NULL)
-            return;
-        os_memcpy(lock_page, lock_page_str, slen);
-
-        espconn_send(pespconn, lock_page, sizeof(lock_page_str));
-
-        os_free(lock_page);
-    }
+    espconn_regist_time(pespconn, 20, 1); /* close idle web connections after 20 s */
 }
 #endif /* WEB_CONFIG */
 
@@ -3958,6 +3791,7 @@ void wifi_handle_event_cb(System_Event_t *evt)
 
     case EVENT_STAMODE_DISCONNECTED:
         os_printf("disconnect from ssid %s, reason %d\r\n", evt->event_info.disconnected.ssid, evt->event_info.disconnected.reason);
+        web_last_disc_reason = evt->event_info.disconnected.reason;
         connected = false;
 
 #if MDNS_REPEATER

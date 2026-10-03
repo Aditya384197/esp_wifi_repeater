@@ -9,6 +9,8 @@
 #include "lwip/pbuf.h"
 #include "lwip/err.h"
 #include "osapi.h"
+#include "os_type.h"
+#include "ets_sys.h"
 #include "user_interface.h"
 #include "sys_time.h"
 #include "config_flash.h"
@@ -34,6 +36,7 @@ static netif_output_fn      s_orig_output_sta;
 static netif_output_fn      s_orig_output_ap;
 static netif_linkoutput_fn  s_orig_lo_sta;
 static netif_linkoutput_fn  s_orig_lo_ap;
+static bool                 s_bridge_inited;
 
 /* -------------------------------------------------------------------------
  * Compact packed header types
@@ -110,17 +113,27 @@ typedef struct {
  * Time helper
  * ------------------------------------------------------------------------- */
 
-static uint32_t ICACHE_FLASH_ATTR now_secs(void)
+/* Seconds counter, refreshed once per second by a timer: avoids a 64-bit
+   division (slow on the lx106) for every forwarded packet. */
+static volatile uint32_t s_now_s;
+static os_timer_t s_clock_timer;
+
+static void ICACHE_FLASH_ATTR clock_tick_cb(void *arg)
 {
-    return (uint32_t)(get_long_systime() / 1000000ULL);
+    s_now_s = (uint32_t)(get_long_systime() / 1000000ULL);
+}
+
+static inline uint32_t now_secs(void)
+{
+    return s_now_s;
 }
 
 /* -------------------------------------------------------------------------
  * Forwarding Database (FDB)
  * ------------------------------------------------------------------------- */
 
-#define FDB_SIZE   16
-#define FDB_TTL_S 600
+#define FDB_SIZE   32
+#define FDB_TTL_S 7200
 
 typedef struct {
     uint32_t ip;
@@ -188,7 +201,7 @@ static void ICACHE_FLASH_ATTR xid_map_insert(uint32_t xid, const uint8_t *chaddr
             return;
         }
         if (s_xid_map[i].xid == 0 || s_xid_map[i].expires_s <= now) { if (free_idx < 0) free_idx = i; }
-        if (s_xid_map[i].expires_s < oldest_exp) { oldest_exp = s_fdb[i].expires_s; oldest_idx = i; }
+        if (s_xid_map[i].expires_s < oldest_exp) { oldest_exp = s_xid_map[i].expires_s; oldest_idx = i; }
     }
     int idx = (free_idx >= 0) ? free_idx : oldest_idx;
     s_xid_map[idx].xid = xid; os_memcpy(s_xid_map[idx].chaddr, chaddr, 6); s_xid_map[idx].expires_s = now + XID_TTL_S;
@@ -542,6 +555,38 @@ static err_t ICACHE_FLASH_ATTR bridge_input_ap(struct pbuf *p, struct netif *inp
     if (config.status_led <= 16)
         easygpio_outputSet(config.status_led, 1);
 
+    /* FAST PATH: unicast IPv4 (TCP/ICMP/plain UDP) frame from a client to the
+       router. Rewritten in place and forwarded without allocating/copying a
+       second buffer (the old code copied every single frame). */
+    if (p->len == p->tot_len && p->len >= sizeof(eth_hdr_t) + sizeof(ip_hdr_t)) {
+        eth_hdr_t *fe = (eth_hdr_t *)p->payload;
+        if ((fe->dst[0] & 0x01) == 0 && ntohs(fe->type) == ETHTYPE_IP &&
+            os_memcmp(fe->dst, s_ap_nif->hwaddr, 6) != 0) {
+            ip_hdr_t *fip = (ip_hdr_t *)((uint8_t *)p->payload + sizeof(eth_hdr_t));
+            bool special = false;
+            if (fip->proto == 17) {
+                uint16_t uo = sizeof(eth_hdr_t) + (fip->vhl & 0x0f) * 4;
+                if (p->len >= uo + sizeof(udp_hdr_t)) {
+                    udp_hdr_t *fu = (udp_hdr_t *)((uint8_t *)p->payload + uo);
+                    uint16_t dp = ntohs(fu->dst_port);
+                    if (dp == 67 || dp == 68 || dp == 5353) special = true;
+                } else special = true;
+            }
+            if (!special) {
+                Bytes_out += p->tot_len;
+                Packets_out++;
+#if DAILY_LIMIT
+                Bytes_per_day += p->tot_len;
+#endif
+                fdb_insert(fip->src, fe->src);
+                os_memcpy(fe->src, s_sta_nif->hwaddr, 6);
+                s_orig_lo_sta(s_sta_nif, p);
+                pbuf_free(p);
+                return ERR_OK;
+            }
+        }
+    }
+
     struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len + 16, PBUF_RAM);
 
     Bytes_out += p->tot_len;
@@ -609,8 +654,6 @@ static err_t ICACHE_FLASH_ATTR bridge_input_ap(struct pbuf *p, struct netif *inp
 
 static err_t ICACHE_FLASH_ATTR bridge_input_sta(struct pbuf *p, struct netif *inp)
 {
-    struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
-
     Bytes_in += p->tot_len;
     Packets_in++;
 #if DAILY_LIMIT
@@ -618,7 +661,37 @@ static err_t ICACHE_FLASH_ATTR bridge_input_sta(struct pbuf *p, struct netif *in
 #endif
     if (config.status_led <= 16)
         easygpio_outputSet(config.status_led, 0);
-        
+
+    /* FAST PATH: unicast IPv4 frame from the router for one of our clients:
+       rewrite MACs in place and hand it to the AP side, no copy. */
+    if (p->len == p->tot_len && p->len >= sizeof(eth_hdr_t) + sizeof(ip_hdr_t) &&
+        s_sta_nif->ip_addr.addr != 0) {
+        eth_hdr_t *fe = (eth_hdr_t *)p->payload;
+        if ((fe->dst[0] & 0x01) == 0 && ntohs(fe->type) == ETHTYPE_IP &&
+            os_memcmp(fe->src, s_ap_nif->hwaddr, 6) != 0) {
+            ip_hdr_t *fip = (ip_hdr_t *)((uint8_t *)p->payload + sizeof(eth_hdr_t));
+            bool special = false;
+            if (fip->proto == 17) {
+                uint16_t uo = sizeof(eth_hdr_t) + (fip->vhl & 0x0f) * 4;
+                if (p->len >= uo + sizeof(udp_hdr_t)) {
+                    udp_hdr_t *fu = (udp_hdr_t *)((uint8_t *)p->payload + uo);
+                    if (ntohs(fu->src_port) == 67 || ntohs(fu->dst_port) == 68) special = true;
+                } else special = true;
+            }
+            if (!special && fip->dst != s_sta_nif->ip_addr.addr) {
+                const uint8_t *cm = fdb_lookup(fip->dst);
+                if (cm) {
+                    os_memcpy(fe->dst, cm, 6);
+                    os_memcpy(fe->src, s_ap_nif->hwaddr, 6);
+                    s_orig_lo_ap(s_ap_nif, p);
+                    pbuf_free(p);
+                    return ERR_OK;
+                }
+            }
+        }
+    }
+
+    struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
     if (!q) return s_orig_input_sta(p, inp);
     pbuf_copy(q, p);
 
@@ -722,15 +795,37 @@ static err_t ICACHE_FLASH_ATTR bridge_input_sta(struct pbuf *p, struct netif *in
 */
 void ICACHE_FLASH_ATTR bridge_init(struct netif *sta_nif, struct netif *ap_nif)
 {
+    /* bridge_init() is called on EVERY GOT_IP event (each reconnect to the router).
+       The hooks must be installed only once: re-saving the already patched
+       functions as "original" made the bridge call itself endlessly
+       (stack overflow -> reset -> internet drops to 0 for a while). */
     s_sta_nif = sta_nif; s_ap_nif = ap_nif;
-    s_orig_input_sta = sta_nif->input; sta_nif->input = bridge_input_sta;
-    s_orig_input_ap = ap_nif->input; ap_nif->input = bridge_input_ap;
-    s_orig_output_sta = sta_nif->output; sta_nif->output = bridge_output_sta;
-    s_orig_output_ap = ap_nif->output; ap_nif->output = bridge_output_ap;
-    s_orig_lo_sta = sta_nif->linkoutput; s_orig_lo_ap = ap_nif->linkoutput;
+    if (sta_nif->input != bridge_input_sta)      { s_orig_input_sta  = sta_nif->input;      sta_nif->input      = bridge_input_sta; }
+    if (ap_nif->input  != bridge_input_ap)       { s_orig_input_ap   = ap_nif->input;       ap_nif->input       = bridge_input_ap; }
+    if (sta_nif->output != bridge_output_sta)    { s_orig_output_sta = sta_nif->output;     sta_nif->output     = bridge_output_sta; }
+    if (ap_nif->output  != bridge_output_ap)     { s_orig_output_ap  = ap_nif->output;      ap_nif->output      = bridge_output_ap; }
+    if (s_orig_lo_sta == NULL) s_orig_lo_sta = sta_nif->linkoutput;
+    if (s_orig_lo_ap  == NULL) s_orig_lo_ap  = ap_nif->linkoutput;
     netif_set_default(sta_nif); sta_nif->napt = 0; ap_nif->napt = 0;
-    os_memset(s_fdb, 0, sizeof(s_fdb)); os_memset(s_xid_map, 0, sizeof(s_xid_map));
-    struct softap_config ap_cfg; wifi_softap_get_config(&ap_cfg); ap_cfg.channel = my_channel; wifi_softap_set_config(&ap_cfg);
+
+    if (!s_bridge_inited) {
+        s_now_s = (uint32_t)(get_long_systime() / 1000000ULL);
+        os_timer_disarm(&s_clock_timer);
+        os_timer_setfn(&s_clock_timer, (os_timer_func_t *)clock_tick_cb, NULL);
+        os_timer_arm(&s_clock_timer, 1000, 1);
+        /* keep learned clients across reconnects; clear only at first start */
+        os_memset(s_fdb, 0, sizeof(s_fdb)); os_memset(s_xid_map, 0, sizeof(s_xid_map));
+        s_bridge_inited = true;
+    }
+
+    /* wifi_softap_set_config() restarts the AP and kicks all clients:
+       only do it when the channel really has to change */
+    struct softap_config ap_cfg;
+    wifi_softap_get_config(&ap_cfg);
+    if (my_channel != 0 && ap_cfg.channel != my_channel) {
+        ap_cfg.channel = my_channel;
+        wifi_softap_set_config(&ap_cfg);
+    }
     wifi_set_sleep_type(NONE_SLEEP_T);
     os_printf("bridge: init done\n");
 }

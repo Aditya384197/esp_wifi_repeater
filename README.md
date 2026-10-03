@@ -1,3 +1,15 @@
+# ESP8266 WiFi Repeater (improved fork)
+
+Build: push to GitHub, the workflow `.github/workflows/build.yml` builds `VARIANT=bridge` and commits the new binaries into `firmware/`.
+Flash the single image at 0x0:
+
+    esptool.py write_flash -ff 40m -fm dio -fs 32m 0x0 firmware/ESP8266_Repeater_FULL_flash_at_0x0.bin
+
+Changes vs. upstream: new web dashboard (`user/web_ui.c`: status, RSSI/distance, scan, uplink/AP settings, restart, factory reset),
+zero-copy fast path for unicast IPv4 in `user/bridge.c`, idempotent `bridge_init()`, no AP restart on reconnect.
+
+---
+
 # esp_wifi_repeater
 A full functional WiFi NAT router (and now also a WiFi repeater aka. L2 bridge)
 

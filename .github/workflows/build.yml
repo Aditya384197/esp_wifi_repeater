@@ -6,44 +6,92 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-esp8266:
-    name: Build ESP8266 firmware
+    name: Build and update ESP8266 firmware
     runs-on: ubuntu-latest
-    container: martinfger/iot_devel:1.0
 
     steps:
-      - name: Build firmware
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd /home/esp
-          rm -rf esp_wifi_repeater
-          git clone --depth 1 "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" esp_wifi_repeater
-          cd esp_wifi_repeater
-          make
-          test -d firmware
-          find firmware -maxdepth 2 -type f -print
-
-      - name: Package ESP8266 firmware
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd /home/esp/esp_wifi_repeater
-          rm -rf /tmp/esp8266-firmware
-          mkdir -p /tmp/esp8266-firmware
-          find firmware -maxdepth 2 -type f \
-            \( -name '*.bin' -o -name '*.elf' -o -name '*.map' \) \
-            -exec cp --parents {} /tmp/esp8266-firmware/ \;
-          test -n "$(find /tmp/esp8266-firmware -type f -print -quit)"
-          tar -C /tmp/esp8266-firmware -czf /home/esp/esp8266-firmware.tar.gz .
-
-      - name: Upload ESP8266 firmware
-        uses: actions/upload-artifact@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          name: esp8266-firmware
-          path: /home/esp/esp8266-firmware.tar.gz
-          if-no-files-found: error
-          retention-days: 30
+          fetch-depth: 0
+
+      - name: Build firmware inside ESP8266 build container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            martinfger/iot_devel:1.0 \
+            bash -lc 'make'
+
+      - name: Update main firmware BIN in repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p firmware
+
+          # Find the firmware BIN produced by the build, while ignoring
+          # the repository's existing firmware/ copy.
+          mapfile -t BUILT_BINS < <(
+            find . -type f -name '*.bin' \
+              ! -path './firmware/*' \
+              ! -path './.git/*' \
+              -print
+          )
+
+          if [ "${#BUILT_BINS[@]}" -eq 0 ]; then
+            echo "ERROR: No newly built .bin firmware was found."
+            exit 1
+          fi
+
+          if [ "${#BUILT_BINS[@]}" -gt 1 ]; then
+            echo "ERROR: More than one newly built .bin was found:"
+            printf '  %s\n' "${BUILT_BINS[@]}"
+            echo "Refusing to guess which firmware is the main ESP8266 firmware."
+            exit 1
+          fi
+
+          BUILT_BIN="${BUILT_BINS[0]}"
+
+          # Use the existing main BIN name when exactly one BIN already
+          # exists in the repository's firmware/ directory.
+          mapfile -t MAIN_BINS < <(
+            find firmware -maxdepth 1 -type f -name '*.bin' -print
+          )
+
+          if [ "${#MAIN_BINS[@]}" -eq 1 ]; then
+            TARGET_BIN="${MAIN_BINS[0]}"
+          else
+            TARGET_BIN="firmware/esp_wifi_repeater.bin"
+          fi
+
+          echo "Built firmware : $BUILT_BIN"
+          echo "Repository BIN : $TARGET_BIN"
+
+          cp -f "$BUILT_BIN" "$TARGET_BIN"
+          ls -lh "$TARGET_BIN"
+
+      - name: Commit updated firmware BIN
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add firmware/*.bin
+
+          if git diff --cached --quiet; then
+            echo "No firmware change to commit."
+            exit 0
+          fi
+
+          git commit -m "Update ESP8266 firmware build"
+          git push

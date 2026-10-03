@@ -1,139 +1,78 @@
-name: Build ESP8266 Firmware
+# Path in repo: .github/workflows/build.yml
+# Builds ONLY the ESP8266 WiFi repeater (VARIANT=bridge), writes the new bins
+# into the root firmware/ folder and commits them back automatically.
+name: Build ESP8266 Repeater Firmware
 
 on:
   push:
+    branches: [ main, master ]
+    paths-ignore:
+      - 'firmware/**'
+      - 'firmware-repeater/**'
+      - '**.md'
   workflow_dispatch:
 
-# The workflow updates firmware files in this repository.
 permissions:
   contents: write
 
+concurrency:
+  group: build-esp8266-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-esp8266:
-    name: Build and update ESP8266 firmware
+  build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+      - uses: actions/checkout@v4
 
-      - name: Build ESP8266 firmware with the project's legacy toolchain
-        shell: bash
+      - name: Build firmware (VARIANT=bridge)
         run: |
-          set -euo pipefail
-
-          # IMPORTANT:
-          # The Makefile expects esp-open-sdk beside this repository:
-          #   /home/esp/esp_wifi_repeater
-          #   /home/esp/esp-open-sdk
-          # The Docker image already contains that SDK, so mount only the
-          # repository at the expected path instead of using /workspace.
-          # Run with the GitHub runner UID/GID so Docker-created files are
-          # writable by the runner and no permission error is left behind.
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --env HOME=/tmp \
-            --env USER=runner \
-            --volume "$GITHUB_WORKSPACE:/home/esp/esp_wifi_repeater" \
-            --workdir /home/esp/esp_wifi_repeater \
+          chmod -R a+rwX "$GITHUB_WORKSPACE"
+          docker run --rm --user root \
+            -v "$GITHUB_WORKSPACE":/home/esp/esp_wifi_repeater \
+            -w /home/esp/esp_wifi_repeater \
             martinfger/iot_devel:1.0 \
-            bash -lc 'set -e; make clean; make'
+            bash -c "rm -rf build && make VARIANT=bridge V=1"
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
-      - name: Verify ESP8266 firmware output
-        shell: bash
+      - name: Create single flashable bin (flash at 0x0)
         run: |
-          set -euo pipefail
-
-          for file in \
-            firmware/0x00000.bin \
-            firmware/0x02000.bin \
-            firmware/0x82000.bin \
-            firmware/sha1sums; do
-            test -s "$file" || {
-              echo "ERROR: Missing or empty firmware file: $file"
-              exit 1
-            }
-          done
-
-          echo "ESP8266 firmware files produced successfully:"
-          ls -lh firmware/0x00000.bin firmware/0x02000.bin firmware/0x82000.bin firmware/sha1sums
-
-      - name: Create single-file ESP8266 merged firmware
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Create one flashable image containing exactly the three images
-          # produced by the project's Makefile at their required offsets.
-          # The merged image is intended to be flashed once at 0x00000.
+          set -e
+          test -s firmware/0x02000.bin
+          test -s rboot.bin
           python3 - <<'PY'
-          from pathlib import Path
-
-          parts = [
-              (0x00000, Path("firmware/0x00000.bin")),
-              (0x02000, Path("firmware/0x02000.bin")),
-              (0x82000, Path("firmware/0x82000.bin")),
-          ]
-          out = Path("firmware/0x00000-merged.bin")
-
-          for address, path in parts:
-              if not path.is_file() or path.stat().st_size == 0:
-                  raise SystemExit(f"Missing or empty firmware part: {path}")
-
-          end = max(address + path.stat().st_size for address, path in parts)
-          image = bytearray(b"\xff") * end
-
-          occupied = []
-          for address, path in parts:
-              data = path.read_bytes()
-              part_end = address + len(data)
-              for old_start, old_end, old_name in occupied:
-                  if address < old_end and old_start < part_end:
-                      raise SystemExit(
-                          f"Firmware images overlap: {path} with {old_name}"
-                      )
-              image[address:part_end] = data
-              occupied.append((address, part_end, str(path)))
-
-          out.write_bytes(image)
-          print(f"Created: {out}")
-          print(f"Flash address: 0x00000")
-          print(f"Image size: {len(image)} bytes")
+          rb  = open('rboot.bin', 'rb').read()
+          app = open('firmware/0x02000.bin', 'rb').read()
+          assert len(rb) <= 0x2000
+          out = rb + b'\xff' * (0x2000 - len(rb)) + app
+          open('firmware/ESP8266_Repeater_FULL_flash_at_0x0.bin', 'wb').write(out)
+          print('full image bytes:', len(out))
           PY
+          cd firmware
+          sha1sum 0x00000.bin 0x02000.bin 0x82000.bin ESP8266_Repeater_FULL_flash_at_0x0.bin > sha1sums
+          ls -l
 
-          test -s firmware/0x00000-merged.bin
-          ls -lh firmware/0x00000.bin firmware/0x02000.bin firmware/0x82000.bin firmware/0x00000-merged.bin
-
-      - name: Verify single-file firmware image
-        shell: bash
+      - name: Commit new firmware to repo
         run: |
-          set -euo pipefail
-          test -s firmware/0x00000-merged.bin
-          echo "Single-file ESP8266 firmware ready."
-          echo "Flash address: 0x00000"
-
-      - name: Commit updated firmware to repository
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add \
-            firmware/0x00000.bin \
-            firmware/0x02000.bin \
-            firmware/0x82000.bin \
-            firmware/sha1sums \
-            firmware/0x00000-merged.bin
-
+          git add -f firmware
           if git diff --cached --quiet; then
-            echo "Firmware is already up to date. No commit required."
-            exit 0
+            echo "No firmware change"
+          else
+            git commit -m "Auto-build: update ESP8266 repeater firmware [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
-          git commit -m "Update ESP8266 firmware [skip ci]"
-          git push
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP8266_Repeater_firmware
+          path: |
+            firmware/ESP8266_Repeater_FULL_flash_at_0x0.bin
+            firmware/0x00000.bin
+            firmware/0x02000.bin
+            firmware/0x82000.bin
+            firmware/sha1sums

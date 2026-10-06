@@ -1,6 +1,4 @@
-# Path in repo: .github/workflows/build.yml
-# Builds ONLY the ESP8266 WiFi repeater (VARIANT=bridge), writes the new bins
-# into the root firmware/ folder and commits them back automatically.
+# Builds the ESP8266 repeater firmware and commits the new binaries into firmware/
 name: Build ESP8266 Repeater Firmware
 
 on:
@@ -8,7 +6,6 @@ on:
     branches: [ main, master ]
     paths-ignore:
       - 'firmware/**'
-      - 'firmware-repeater/**'
       - '**.md'
   workflow_dispatch:
 
@@ -26,14 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build firmware (VARIANT=bridge)
+      - name: Build firmware
         run: |
           chmod -R a+rwX "$GITHUB_WORKSPACE"
           docker run --rm --user root \
             -v "$GITHUB_WORKSPACE":/home/esp/esp_wifi_repeater \
             -w /home/esp/esp_wifi_repeater \
             martinfger/iot_devel:1.0 \
-            bash -c "rm -rf build && make VARIANT=bridge V=1"
+            bash -c "rm -rf build firmware/*.bin firmware/sha1sums && make V=1"
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
       - name: Create single flashable bin (flash at 0x0)
@@ -47,7 +44,7 @@ jobs:
           assert len(rb) <= 0x2000
           out = rb + b'\xff' * (0x2000 - len(rb)) + app
           open('firmware/ESP8266_Repeater_FULL_flash_at_0x0.bin', 'wb').write(out)
-          print('full image bytes:', len(out))
+          print('app bytes:', len(app), ' full image bytes:', len(out))
           PY
           cd firmware
           sha1sum 0x00000.bin 0x02000.bin 0x82000.bin ESP8266_Repeater_FULL_flash_at_0x0.bin > sha1sums

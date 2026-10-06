@@ -37,7 +37,7 @@ ESPTOOLOPTS	= -ff 40m -fm dio -fs 32m
 TARGET		= app
 
 # which modules (subdirectories) of the project to include in compiling
-MODULES		= driver user mqtt easygpio
+MODULES		= user
 EXTRA_INCDIR    = include $(BUILD_AREA)/esp-open-sdk/esp-open-lwip/include
 #EXTRA_INCDIR    = include
 
@@ -49,10 +49,6 @@ LIBS		= c gcc hal pp phy net80211 lwip_open_napt wpa wpa2 main crypto
 # compiler flags using during compilation of source files
 CFLAGS		= -Os -g -O2 -Wpointer-arith -Wundef -Werror -Wl,-EL -fno-inline-functions -nostdlib -mlongcalls -mtext-section-literals  -D__ets__ -DICACHE_FLASH -DLWIP_OPEN_SRC -DUSE_OPTIMIZE_PRINTF
 
-VARIANT ?= default
-ifeq ($(VARIANT),bridge)
-    CFLAGS += -include user/user_config_bridge.h
-endif
 
 # linker flags used to generate the main object file
 LDFLAGS		= -nostdlib -Wl,--no-check-sections -u call_user_start -Wl,-static -L. -L$(SDK_BASE)/ld
